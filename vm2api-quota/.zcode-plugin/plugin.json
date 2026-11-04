@@ -1,0 +1,29 @@
+{
+  "name": "vm2api-quota",
+  "version": "0.4.0",
+  "description": "Type /quota to see the current account's 5h/7d usage plus per-account pool quotas and billing from a vm2api gateway. Executed locally — no model involvement, nothing enters the LLM context. Read-only GETs.",
+  "commands": ["./commands"],
+  "hooks": "./hooks/hooks.json",
+  "userConfig": {
+    "base_url": {
+      "type": "string",
+      "title": "Gateway URL",
+      "description": "vm2api gateway base URL. Optional — falls back to VM2API_BASE_URL / ANTHROPIC_BASE_URL / settings.json.",
+      "required": false
+    },
+    "master_key": {
+      "type": "string",
+      "title": "Master API key",
+      "description": "The gateway master key (VM2API_API_KEY on the server). Unlocks per-account pool quotas and billing sections. Stored in secure storage. Optional.",
+      "sensitive": true,
+      "required": false
+    },
+    "panel_token": {
+      "type": "string",
+      "title": "Panel session token",
+      "description": "Any /api/panel/* credential (console session token from POST /api/panel/login). Alternative to the master key. Stored in secure storage. Optional.",
+      "sensitive": true,
+      "required": false
+    }
+  }
+}
