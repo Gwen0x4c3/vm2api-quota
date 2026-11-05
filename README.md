@@ -59,7 +59,7 @@ The input is intercepted and executed locally: the report prints to your termina
 - **Menu bar**: `Q 5h 98 ▮▮▮▮▮ 7d 58 ▮▮▯▯▯` — mini bars + numbers, colored by severity (green → yellow → orange → red, `⚠` on WARN/BLOCKED).
 - **Click** opens a dashboard popover: current account, per-account pool (with USD estimates), billing, and **Quality of Service** — success/error rate with 429/503/529 counts, TTFT and duration percentiles, QPS/TPS, cache hit rate, sticky sessions, and per-model rows (same `/api/panel/request-logs/stats` last-hour window the console overview renders).
 - Auto-refresh every 60 s, manual refresh button, read-only GETs only.
-- Reuses the plugin's configuration (`~/.claude/vm2api-quota-config.json`, then env vars, then `settings.json`) — zero extra setup if `/quota` already works.
+- **Configuration is built in**: click the gear (⚙) in the popover — or it opens automatically on first run — and enter the gateway URL, API key, and optional panel token. Stored in the app's own file `~/.config/vm2api-quota/menubar.json` (0600). A master key covers both `/v1` and panel routes.
 
 ```sh
 cd menubar

@@ -13,14 +13,9 @@
 //   GET {base}/api/panel/usage                                  (panel credential)
 //   GET {base}/api/panel/request-logs/stats?bucket=hour&since=… (panel credential)
 //
-// Config resolution (identical to scripts/quota.sh):
-//   1. ~/.claude/vm2api-quota-config.json  { base_url, api_key, panel_token }
-//   2. CLAUDE_PLUGIN_OPTION_BASE_URL / _MASTER_KEY / _PANEL_TOKEN env
-//   3. VM2API_BASE_URL / ANTHROPIC_BASE_URL, VM2API_API_KEY / ANTHROPIC_AUTH_TOKEN /
-//      ANTHROPIC_API_KEY, VM2API_PANEL_TOKEN env
-//   4. env.ANTHROPIC_BASE_URL / _AUTH_TOKEN / _API_KEY in ~/.claude/settings.json
-//      (then ~/.zcode/settings.json)
-//   No default gateway URL: without configuration the app shows a setup hint.
+// Config — the app's OWN config file, editable from the settings form in the
+// popover (this app does not read the plugin's config):
+//   ~/.config/vm2api-quota/menubar.json  { base_url, api_key, panel_token }
 //
 // Build:  menubar/build.sh        Run:  menubar/bin/VmQuotaBar  (or build.sh --app)
 
@@ -47,7 +42,7 @@ private func dig(_ d: [String: Any]?, _ path: String...) -> Any? {
     return cur
 }
 
-// MARK: - Config
+// MARK: - Config (the app's own file, edited via the in-app settings form)
 
 struct GatewayConfig {
     var baseURL: String
@@ -55,54 +50,35 @@ struct GatewayConfig {
     var panelToken: String
     var configPath: String
 
-    static func load() -> GatewayConfig {
-        let home = NSHomeDirectory()
-        let fm = FileManager.default
-        let env = ProcessInfo.processInfo.environment
+    static var path: String { NSHomeDirectory() + "/.config/vm2api-quota/menubar.json" }
 
-        // 1. plugin runtime config file
-        let cfgPath = home + "/.claude/vm2api-quota-config.json"
+    static func load() -> GatewayConfig {
         var cfg: [String: Any] = [:]
-        if let data = fm.contents(atPath: cfgPath) {
+        if let data = FileManager.default.contents(atPath: path) {
             cfg = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
         }
-        // 4. settings.json env fallbacks
-        var settingsEnv: [String: String] = [:]
-        for p in [home + "/.claude/settings.json", home + "/.zcode/settings.json"] {
-            if let data = fm.contents(atPath: p),
-               let j = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-               let e = j["env"] as? [String: Any] {
-                settingsEnv = e.compactMapValues { $0 as? String }
-                if !settingsEnv.isEmpty { break }
-            }
-        }
-        let fileBase = asStr(cfg["base_url"]) ?? ""
-        let fileKey = asStr(cfg["api_key"]) ?? ""
-        let filePanel = asStr(cfg["panel_token"]) ?? ""
-        let opt = { (k: String) in env["CLAUDE_PLUGIN_OPTION_" + k] ?? "" }
-
-        let base = firstNonEmpty(fileBase,
-                                 opt("BASE_URL"),
-                                 env["VM2API_BASE_URL"] ?? "", env["ANTHROPIC_BASE_URL"] ?? "",
-                                 settingsEnv["ANTHROPIC_BASE_URL"] ?? "")
-        let key = firstNonEmpty(fileKey,
-                                opt("MASTER_KEY"),
-                                env["VM2API_API_KEY"] ?? "",
-                                env["ANTHROPIC_AUTH_TOKEN"] ?? "", env["ANTHROPIC_API_KEY"] ?? "",
-                                settingsEnv["ANTHROPIC_AUTH_TOKEN"] ?? "", settingsEnv["ANTHROPIC_API_KEY"] ?? "")
-        // panel: dedicated credential first, then the master key (works on panel routes)
-        let panel = firstNonEmpty(opt("PANEL_TOKEN"),
-                                  env["VM2API_PANEL_TOKEN"] ?? "",
-                                  filePanel,
-                                  fileKey, opt("MASTER_KEY"), env["VM2API_API_KEY"] ?? "")
-        return GatewayConfig(baseURL: base.hasSuffix("/") ? String(base.dropLast()) : base,
-                             apiKey: key, panelToken: panel, configPath: cfgPath)
+        var base = asStr(cfg["base_url"]) ?? ""
+        if base.hasSuffix("/") { base = String(base.dropLast()) }
+        return GatewayConfig(baseURL: base,
+                             apiKey: asStr(cfg["api_key"]) ?? "",
+                             panelToken: asStr(cfg["panel_token"]) ?? "",
+                             configPath: path)
     }
-}
 
-private func firstNonEmpty(_ s: String...) -> String {
-    for x in s where !x.isEmpty { return x }
-    return ""
+    static func save(baseURL: String, apiKey: String, panelToken: String) -> Bool {
+        let trimmed = { (s: String) in s.trimmingCharacters(in: .whitespacesAndNewlines) }
+        var base = trimmed(baseURL)
+        while base.hasSuffix("/") { base = String(base.dropLast()) }
+        let obj: [String: String] = ["base_url": base,
+                                      "api_key": trimmed(apiKey),
+                                      "panel_token": trimmed(panelToken)]
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) else { return false }
+        let dir = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        return FileManager.default.createFile(atPath: path, contents: data,
+                                              attributes: [.posixPermissions: 0o600])
+    }
 }
 
 // MARK: - Snapshot models
@@ -195,11 +171,11 @@ enum Fetcher {
     static func fetchAll(cfg: GatewayConfig) async -> Snapshot {
         var s = Snapshot()
         guard !cfg.baseURL.isEmpty else {
-            s.error = "No gateway URL configured.\nSet base_url in\n\(cfg.configPath)\nor VM2API_BASE_URL / ANTHROPIC_BASE_URL."
+            s.error = "Not configured yet — open settings (⚙) and enter the gateway URL."
             return s
         }
         guard !cfg.apiKey.isEmpty else {
-            s.error = "No API key configured.\nSet api_key in\n\(cfg.configPath)\nor VM2API_API_KEY / ANTHROPIC_AUTH_TOKEN."
+            s.error = "No API key — open settings (⚙) and paste your key."
             return s
         }
 
@@ -355,6 +331,14 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Save the settings form, reload config, and refresh immediately.
+    func saveConfig(baseURL: String, apiKey: String, panelToken: String) -> Bool {
+        guard GatewayConfig.save(baseURL: baseURL, apiKey: apiKey, panelToken: panelToken) else { return false }
+        cfg = GatewayConfig.load()
+        refresh()
+        return true
+    }
+
     func refresh() {
         guard !refreshing else { return }
         refreshing = true
@@ -389,7 +373,11 @@ enum BarTitle {
 
         guard snap.ok else {
             add("Q ", mono, baseColor)
-            add(snap.error.isEmpty ? "…" : "⚠", mono, .systemRed)
+            if snap.error.isEmpty {
+                add("…", mono, baseColor) // initial load in progress
+            } else {
+                add("⚠", mono, .systemRed)
+            }
             return out
         }
         add("Q ", mono, baseColor)
@@ -460,9 +448,57 @@ struct QoSRow: View {
     }
 }
 
+struct SettingsForm: View {
+    @EnvironmentObject var state: AppState
+    @State private var base = ""
+    @State private var key = ""
+    @State private var panel = ""
+    @State private var saved = false
+    @State private var failed = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("SETTINGS").font(.caption.weight(.bold)).foregroundStyle(.secondary)
+            TextField("Gateway URL (e.g. http://192.0.2.10:8787)", text: $base)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.callout, design: .monospaced))
+                .autocorrectionDisabled()
+            SecureField("API key (sk-vm-… or the gateway master key)", text: $key)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.callout, design: .monospaced))
+            SecureField("Panel token (optional — a master key already covers it)", text: $panel)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.callout, design: .monospaced))
+            HStack {
+                Button("Save & Refresh") {
+                    if state.saveConfig(baseURL: base, apiKey: key, panelToken: panel) {
+                        saved = true; failed = false
+                    } else {
+                        failed = true; saved = false
+                    }
+                }
+                if saved { Text("saved ✓").font(.caption).foregroundStyle(.green) }
+                if failed { Text("save failed").font(.caption).foregroundStyle(.red) }
+                Spacer()
+                Text(state.cfg.configPath).font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+        .padding(8)
+        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+        .onAppear {
+            base = state.cfg.baseURL
+            key = state.cfg.apiKey
+            panel = state.cfg.panelToken
+        }
+    }
+}
+
 struct PanelView: View {
     @EnvironmentObject var state: AppState
+    @State private var showSettings = false
     private let fixed: CGFloat = 460
+
+    private var configured: Bool { !state.cfg.baseURL.isEmpty }
 
     var body: some View {
         let s = state.snap
@@ -471,15 +507,25 @@ struct PanelView: View {
                 // header
                 HStack {
                     Text("vm2api quota").font(.headline)
-                    Text(state.cfg.baseURL.isEmpty ? "(not configured)" : state.cfg.baseURL)
+                    Text(configured ? state.cfg.baseURL : "(not configured)")
                         .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
                     Spacer()
                     if state.refreshing { ProgressView().controlSize(.small) }
+                    Button {
+                        showSettings.toggle()
+                    } label: {
+                        Image(systemName: "gearshape")
+                    }
+                    .controlSize(.small)
+                    .help("Settings")
                     Button("Refresh") { state.refresh() }.controlSize(.small)
                 }
+                if showSettings || !configured {
+                    SettingsForm()
+                }
                 if !s.ok {
-                    Text(s.error).font(.callout).foregroundStyle(.red).padding(.top, 6)
-                    Text("config file: \(state.cfg.configPath)").font(.caption2).foregroundStyle(.secondary)
+                    Text(configured ? s.error : "Welcome — enter your gateway URL and API key above, then Save.")
+                        .font(.callout).foregroundStyle(.red).padding(.top, 4)
                 } else {
                     // current account
                     SectionHeader(title: "CURRENT ACCOUNT", subtitle: "platform \(s.platform) · source \(s.source)")
@@ -577,6 +623,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var monitor: Any?
+    private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -599,6 +646,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.$snap
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.renderTitle() }
+            .store(in: &cancellables)
         renderTitle()
         state.start()
     }
@@ -609,6 +657,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.toolTip = s.ok
             ? "vm2api quota — 5h \(s.w5.pct)% · 7d \(s.w7.pct)%"
             : "vm2api quota — not configured / error"
+        if ProcessInfo.processInfo.environment["VMQUOTA_DEBUG_TITLE"] == "1" {
+            let plain = s.ok
+                ? "ok: 5h \(s.w5.pct)% [\(BarTitle.miniBar(s.w5.pct))] · 7d \(s.w7.pct)% [\(BarTitle.miniBar(s.w7.pct))] · pool \(s.pool.count) · qos \(s.qos.samples) samples"
+                : "not ok: \(s.error.isEmpty ? "loading" : s.error)"
+            fputs("[VmQuotaBar title] " + plain + "\n", stderr)
+        }
     }
 
     @objc private func toggle() {
