@@ -691,6 +691,8 @@ struct PanelView: View {
                 .buttonStyle(.borderless).help("Refresh")
             Button { showSettings.toggle() } label: { Image(systemName: "gearshape") }
                 .buttonStyle(.borderless).help("Settings")
+            Button { NSApp.terminate(nil) } label: { Image(systemName: "power") }
+                .buttonStyle(.borderless).help("Quit VmQuotaBar")
         }
     }
 
