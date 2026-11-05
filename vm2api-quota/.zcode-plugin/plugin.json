@@ -1,6 +1,6 @@
 {
   "name": "vm2api-quota",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Type /quota to see the current account's 5h/7d usage plus per-account pool quotas and billing from a vm2api gateway. Executed locally — no model involvement, nothing enters the LLM context. Read-only GETs.",
   "commands": ["./commands"],
   "hooks": "./hooks/hooks.json",

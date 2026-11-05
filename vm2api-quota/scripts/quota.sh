@@ -353,7 +353,7 @@ status_tag() {
   case "$1" in
     allowed|active)     printf 'OK' ;;
     allowed_warning)    printf 'WARN' ;;
-    blocked)            printf 'BLOCKED' ;;
+    blocked|rejected)   printf 'BLOCKED' ;;
     throttled)          printf 'THROTTLED' ;;
     *)                  printf '%s' "${1:-UNKNOWN}" ;;
   esac
@@ -368,28 +368,39 @@ window_line() { # $1 label, $2 percent, $3 status, $4 reset epoch, $5 optional s
 [ -n "$BASE_URL" ] || fail "No gateway URL configured. Set it via '/quota set base-url <URL>', VM2API_BASE_URL / ANTHROPIC_BASE_URL, or env.ANTHROPIC_BASE_URL in ~/.claude/settings.json"
 [ -n "$API_KEY" ] || fail "No API key found. Set VM2API_API_KEY / ANTHROPIC_AUTH_TOKEN, or configure env.ANTHROPIC_AUTH_TOKEN in ~/.claude/settings.json"
 
+# When every pool account is rate-limited the gateway 429s /v1/usage itself;
+# the panel endpoints still serve the real numbers, so fall back to the pool.
+USAGE_OK=0
+USAGE_NOTE=""
 http_get "$BASE_URL/v1/usage?unit=percent_used" "$API_KEY"
 USAGE_RESP="$RESP"
 case "$CODE" in
-  200) ;; # ok
+  200) USAGE_OK=1 ;; # ok
+  429)
+    if [ -z "$PANEL_TOKEN" ]; then
+      fail "Quota exhausted: /v1/usage is rate-limited (429, upstream_rate_limit). Set a panel credential (e.g. the master key via '/quota set api-key') to keep showing pool-based numbers."
+    fi
+    USAGE_NOTE="(upstream rate-limited 429 - window numbers from the pool)" ;;
   401|403) fail "Gateway auth error (HTTP $CODE): $(printf '%s' "$USAGE_RESP" | head -c 200)" ;;
   000) fail "Request failed: gateway unreachable at $BASE_URL" ;;
   *) fail "Gateway returned HTTP $CODE: $(printf '%s' "$USAGE_RESP" | head -c 200)" ;;
 esac
-case "$USAGE_RESP" in
-  *missing_api_key*|*authentication_error*|*forbidden*)
-    fail "Gateway returned an auth error: $(printf '%s' "$USAGE_RESP" | head -c 200)" ;;
-esac
 
-U5="$(jget .five_hour.utilization)"
-U7="$(jget .seven_day.utilization)"
-R5="$(jget .five_hour.resets_at)"
-R7="$(jget .seven_day.resets_at)"
-S5="$(jget .five_hour.status)"
-S7="$(jget .seven_day.status)"
-PLATFORM="$(jget .platform)"
-SOURCE="$(jget .source)"
-[ -n "$U5" ] || [ -n "$U7" ] || fail "Cannot parse response: $(printf '%s' "$USAGE_RESP" | head -c 200)"
+if [ "$USAGE_OK" = "1" ]; then
+  case "$USAGE_RESP" in
+    *missing_api_key*|*authentication_error*|*forbidden*)
+      fail "Gateway returned an auth error: $(printf '%s' "$USAGE_RESP" | head -c 200)" ;;
+  esac
+  U5="$(jget .five_hour.utilization)"
+  U7="$(jget .seven_day.utilization)"
+  R5="$(jget .five_hour.resets_at)"
+  R7="$(jget .seven_day.resets_at)"
+  S5="$(jget .five_hour.status)"
+  S7="$(jget .seven_day.status)"
+  PLATFORM="$(jget .platform)"
+  SOURCE="$(jget .source)"
+  [ -n "$U5" ] || [ -n "$U7" ] || fail "Cannot parse response: $(printf '%s' "$USAGE_RESP" | head -c 200)"
+fi
 
 # ---------- 2. per-account pool quota (/api/panel/vms) ----------
 
@@ -413,6 +424,36 @@ else
   else
     BILL_NOTE="unavailable (HTTP $CODE from /api/panel/usage)"
   fi
+fi
+
+# 429 fallback: fill the current-account windows from the first pool account
+if [ "$USAGE_OK" != "1" ] && [ -n "$VMS" ]; then
+  if command -v jq >/dev/null 2>&1; then
+    U5="$(printf '%s' "$VMS" | jq -r '(.data.items[0].utilization_5h // 0) * 100 | round' 2>/dev/null || echo 0)"
+    U7="$(printf '%s' "$VMS" | jq -r '(.data.items[0].utilization_7d // 0) * 100 | round' 2>/dev/null || echo 0)"
+    R5="$(printf '%s' "$VMS" | jq -r '.data.items[0].reset_5h // empty' 2>/dev/null || true)"
+    R7="$(printf '%s' "$VMS" | jq -r '.data.items[0].reset_7d // empty' 2>/dev/null || true)"
+    S5="$(printf '%s' "$VMS" | jq -r '.data.items[0].status_5h // "unknown"' 2>/dev/null || echo unknown)"
+    S7="$(printf '%s' "$VMS" | jq -r '.data.items[0].status_7d // "unknown"' 2>/dev/null || echo unknown)"
+  else
+    FALL="$(printf '%s' "$VMS" | python3 -c '
+import json,sys
+try:
+    v=json.load(sys.stdin)["data"]["items"][0]
+    print(round((v.get("utilization_5h") or 0)*100), round((v.get("utilization_7d") or 0)*100),
+          v.get("reset_5h") or "-", v.get("reset_7d") or "-",
+          v.get("status_5h") or "unknown", v.get("status_7d") or "unknown")
+except Exception:
+    print(0, 0, "-", "-", "unknown", "unknown")
+' 2>/dev/null)"
+    U5="$(printf '%s\n' "$FALL" | awk '{print $1}')"
+    U7="$(printf '%s\n' "$FALL" | awk '{print $2}')"
+    R5="$(printf '%s\n' "$FALL" | awk '{print $3}')"; [ "$R5" = "-" ] && R5=""
+    R7="$(printf '%s\n' "$FALL" | awk '{print $4}')"; [ "$R7" = "-" ] && R7=""
+    S5="$(printf '%s\n' "$FALL" | awk '{print $5}')"
+    S7="$(printf '%s\n' "$FALL" | awk '{print $6}')"
+  fi
+  PLATFORM="gateway"; SOURCE="pool"
 fi
 
 pool_rows() { # TSV per line (NO email/uuid: keep identities out of LLM context):
@@ -486,6 +527,7 @@ fi
 
 echo "=== vm2api quota @ ${BASE_URL} ==="
 echo "Current account (platform: ${PLATFORM:-n/a}, source: ${SOURCE:-n/a})"
+[ -n "$USAGE_NOTE" ] && echo "! ${USAGE_NOTE}"
 window_line "5h window:" "$U5" "$S5" "$R5"
 window_line "7d window:" "$U7" "$S7" "$R7"
 

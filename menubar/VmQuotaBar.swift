@@ -145,6 +145,7 @@ struct QoSInfo {
 struct Snapshot {
     var ok = false
     var error = ""
+    var note = ""            // e.g. "window numbers from the pool (429)"
     var platform = "", source = ""
     var w5 = WindowInfo(), w7 = WindowInfo()
     var pool: [PoolAccount] = []
@@ -190,18 +191,34 @@ enum Fetcher {
         }
 
         // 1. current account
+        // When every pool account is rate-limited the gateway 429s /v1/usage
+        // itself; the panel endpoints still serve the real numbers, so fall
+        // back to them (first pool account) and note it.
         let (code, usage) = await getJSON(cfg.baseURL + "/v1/usage?unit=percent_used", token: cfg.apiKey)
-        guard code == 200, let usage = usage else {
+        let usageOK = (code == 200)
+        if usageOK, let usage = usage {
+            s.platform = asStr(usage["platform"]) ?? ""
+            s.source = asStr(usage["source"]) ?? ""
+            s.w5.parse(asDict(usage["five_hour"]))
+            s.w7.parse(asDict(usage["seven_day"]))
+        } else if code == 429 {
+            s.note = "upstream rate-limited (429) — window numbers from the pool"
+            s.platform = "gateway"
+            s.source = "pool"
+        } else {
             s.error = "/v1/usage failed (HTTP \(code)). Check the gateway URL / key."
             return s
         }
-        s.platform = asStr(usage["platform"]) ?? ""
-        s.source = asStr(usage["source"]) ?? ""
-        s.w5.parse(asDict(usage["five_hour"]))
-        s.w7.parse(asDict(usage["seven_day"]))
         s.hasPanel = !cfg.panelToken.isEmpty
 
-        guard s.hasPanel else { s.ok = true; s.updatedAt = Date(); return s }
+        guard s.hasPanel else {
+            if usageOK {
+                s.ok = true; s.updatedAt = Date()
+            } else {
+                s.error = "Quota exhausted — /v1/usage is rate-limited (429). Add a panel credential (the gateway master key) in settings ⚙ to keep showing pool-based numbers."
+            }
+            return s
+        }
 
         // 2. pool
         let (_, vms) = await getJSON(cfg.baseURL + "/api/panel/vms", token: cfg.panelToken)
@@ -220,6 +237,12 @@ enum Fetcher {
                 a.est5 = est(v, "estimate_5h"); a.est7 = est(v, "estimate_7d")
                 s.pool.append(a)
             }
+        }
+        if !usageOK, let f = s.pool.first {
+            s.w5.pct = f.u5; s.w5.status = f.status5; s.w5.resetsAt = f.r5
+            s.w5.resetsText = WindowInfo.resetText(f.r5)
+            s.w7.pct = f.u7; s.w7.status = f.status7; s.w7.resetsAt = f.r7
+            s.w7.resetsText = WindowInfo.resetText(f.r7)
         }
 
         // 3. billing
@@ -303,23 +326,26 @@ enum Fetcher {
 
 enum Severity {
     static func color(forPct pct: Int, status: String) -> NSColor {
-        if status == "blocked" || status == "throttled" { return .systemRed }
-        if pct >= 97 { return .systemRed }
+        if isBlocked(status) { return .systemRed }
+        if pct >= 100 { return .systemRed }
         if pct >= 90 { return .systemOrange }
         if pct >= 70 { return .systemYellow }
         return .systemGreen
+    }
+    static func isBlocked(_ status: String) -> Bool {
+        status == "blocked" || status == "throttled" || status == "rejected"
     }
     static func tag(_ status: String) -> String {
         switch status {
         case "allowed", "active": return "OK"
         case "allowed_warning": return "WARN"
-        case "blocked": return "BLOCKED"
+        case "blocked", "rejected": return "BLOCKED"
         case "throttled": return "THROTTLED"
         default: return status.uppercased()
         }
     }
     static func isWarn(_ status: String) -> Bool {
-        status == "allowed_warning" || status == "blocked" || status == "throttled"
+        status == "allowed_warning" || isBlocked(status)
     }
 }
 
@@ -536,7 +562,7 @@ struct PanelView: View {
 
     private var health: (String, Color) {
         guard s.ok else { return ("Error", .red) }
-        if s.w5.status == "blocked" || s.w7.status == "blocked" { return ("Blocked", .red) }
+        if Severity.isBlocked(s.w5.status) || Severity.isBlocked(s.w7.status) { return ("Blocked", .red) }
         if Severity.isWarn(s.w5.status) || Severity.isWarn(s.w7.status) { return ("Warning", .orange) }
         return ("Healthy", .green)
     }
@@ -616,6 +642,11 @@ struct PanelView: View {
                       status: s.w7.status,
                       resetText: WindowInfo.resetShort(s.w7.resetsAt),
                       est: single?.est7 ?? "")
+            if !s.note.isEmpty {
+                Text(s.note)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+            }
             if !s.hasPanel {
                 Text("pool · billing · QoS need a panel credential — add one in settings ⚙")
                     .font(.system(size: 10))
