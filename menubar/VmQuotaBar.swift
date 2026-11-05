@@ -1,7 +1,7 @@
 // VmQuotaBar.swift — a native macOS menu-bar app (single file, no Xcode project)
 // showing vm2api gateway quota at a glance.
 //
-//   Menu bar : "Q 5h 98 ▮▮▮▮▮  7d 58 ▮▮▯▯▯"  (mini bars + numbers, severity colors)
+//   Menu bar : "89█ 18▂"  (5h then 7d — vertical level bars, severity colors)
 //   Click    : popover dashboard — current account, per-account pool (with USD
 //              estimates), billing, and Quality of Service (success rate,
 //              429/503/529, TTFT/duration percentiles, QPS/TPS, cache hit,
@@ -356,15 +356,18 @@ final class AppState: ObservableObject {
 // MARK: - Menu bar title
 
 enum BarTitle {
-    static func miniBar(_ pct: Int, cells: Int = 5) -> String {
-        let filled = max(0, min(cells, Int((Double(pct) * Double(cells) / 100.0).rounded())))
-        return String(repeating: "▮", count: filled) + String(repeating: "▯", count: cells - filled)
+    /// Vertical level glyph (▁▂▃▄▅▆▇█): fill height tracks the percentage, like
+    /// a signal-strength bar. One glyph wide, so the menu-bar item stays narrow
+    /// and notch-safe (horizontal bars get clipped by the camera cutout).
+    static func vBar(_ pct: Int) -> String {
+        let levels = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+        let idx = max(0, min(7, Int((Double(max(0, min(100, pct))) / 100.0 * 8.0).rounded())))
+        return levels[idx]
     }
 
     static func attributed(_ snap: Snapshot) -> NSAttributedString {
         let out = NSMutableAttributedString()
         let mono = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-        let labelFont = NSFont.systemFont(ofSize: 9, weight: .medium)
         let baseColor = NSColor.labelColor
 
         func add(_ s: String, _ f: NSFont, _ c: NSColor) {
@@ -372,7 +375,6 @@ enum BarTitle {
         }
 
         guard snap.ok else {
-            add("Q ", mono, baseColor)
             if snap.error.isEmpty {
                 add("…", mono, baseColor) // initial load in progress
             } else {
@@ -380,12 +382,11 @@ enum BarTitle {
             }
             return out
         }
-        add("Q ", mono, baseColor)
-        for (label, w) in [("5h", snap.w5), ("7d", snap.w7)] {
+        // "98█ 18▃" — 5h first, then 7d; which-is-which lives in the tooltip
+        for w in [snap.w5, snap.w7] {
             let c = Severity.color(forPct: w.pct, status: w.status)
-            add(label + " ", labelFont, baseColor.withAlphaComponent(0.7))
-            add("\(w.pct) ", mono, c)
-            add(miniBar(w.pct) + "  ", mono, c)
+            add("\(w.pct)", mono, c)
+            add(vBar(w.pct) + " ", mono, c)
         }
         if Severity.isWarn(snap.w5.status) || Severity.isWarn(snap.w7.status) {
             add("⚠", mono, .systemOrange)
@@ -659,7 +660,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             : "vm2api quota — not configured / error"
         if ProcessInfo.processInfo.environment["VMQUOTA_DEBUG_TITLE"] == "1" {
             let plain = s.ok
-                ? "ok: 5h \(s.w5.pct)% [\(BarTitle.miniBar(s.w5.pct))] · 7d \(s.w7.pct)% [\(BarTitle.miniBar(s.w7.pct))] · pool \(s.pool.count) · qos \(s.qos.samples) samples"
+                ? "ok: \(s.w5.pct)\(BarTitle.vBar(s.w5.pct)) \(s.w7.pct)\(BarTitle.vBar(s.w7.pct)) · pool \(s.pool.count) · qos \(s.qos.samples) samples"
                 : "not ok: \(s.error.isEmpty ? "loading" : s.error)"
             fputs("[VmQuotaBar title] " + plain + "\n", stderr)
         }
