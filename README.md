@@ -54,10 +54,10 @@ The input is intercepted and executed locally: the report prints to your termina
 
 ## macOS menu bar app (bonus)
 
-`menubar/` holds a **native SwiftUI menu-bar app** (single file, no Xcode project) that shows quota at a glance, iStat-style:
+`menubar/` holds a **native SwiftUI menu-bar app** (single file, no Xcode project) built as a lightweight menu-bar utility:
 
-- **Menu bar**: `89█ 18▂` — 5h then 7d, each as a percentage next to a vertical level bar (▁▂▃▄▅▆▇█, fill height tracks usage — notch-safe, one glyph wide). Colored by severity (green → yellow → orange → red), `⚠` on WARN/BLOCKED; hover for a tooltip naming each window.
-- **Click** opens a dashboard popover: current account, per-account pool (with USD estimates), billing, and **Quality of Service** — success/error rate with 429/503/529 counts, TTFT and duration percentiles, QPS/TPS, cache hit rate, sticky sessions, and per-model rows (same `/api/panel/request-logs/stats` last-hour window the console overview renders).
+- **Menu bar**: `89 18` — 5h then optional 7d usage percentages, colored by severity (green → yellow → orange → red; red = close to the limit, `⚠` on WARN/BLOCKED). The 7d number can be turned off in settings; hover for a tooltip naming each window.
+- **Click** opens a compact popover (440 pt): a header with a health capsule (Healthy / Warning / Blocked), two usage cards (big percentage + capsule bar, fill = usage, reset countdown, USD estimate), billing with hierarchy (Today large, 5h/7d windows as secondary rows), and Quality of Service (summary row with success rate, expandable Details: error rate with 429/503/529, TTFT and duration percentiles, QPS/TPS, cache hit, sticky sessions, per-model rows — same `/api/panel/request-logs/stats` window the console overview renders). The per-account pool section appears only when there is more than one account, avoiding duplication.
 - Auto-refresh every 60 s, manual refresh button, read-only GETs only.
 - **Configuration is built in**: click the gear (⚙) in the popover — or it opens automatically on first run — and enter the gateway URL, API key, and optional panel token. Stored in the app's own file `~/.config/vm2api-quota/menubar.json` (0600). A master key covers both `/v1` and panel routes.
 

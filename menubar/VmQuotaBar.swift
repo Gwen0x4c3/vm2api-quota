@@ -1,11 +1,11 @@
 // VmQuotaBar.swift — a native macOS menu-bar app (single file, no Xcode project)
 // showing vm2api gateway quota at a glance.
 //
-//   Menu bar : "89█ 18▂"  (5h then 7d — vertical level bars, severity colors)
-//   Click    : popover dashboard — current account, per-account pool (with USD
-//              estimates), billing, and Quality of Service (success rate,
-//              429/503/529, TTFT/duration percentiles, QPS/TPS, cache hit,
-//              sticky scheduling, per-model rows).
+//   Menu bar : "89 18"   (5h usage then optional 7d usage, severity colors —
+//                         red means close to the limit; 7d toggleable in settings)
+//   Click    : compact popover — usage cards (bar fill = USAGE), billing with
+//              hierarchy, collapsible quality-of-service details, pool only
+//              when there is more than one account.
 //
 // Data (read-only GETs, same endpoints as the vm2api-quota plugin):
 //   GET {base}/v1/usage?unit=percent_used                       (API key)
@@ -15,7 +15,8 @@
 //
 // Config — the app's OWN config file, editable from the settings form in the
 // popover (this app does not read the plugin's config):
-//   ~/.config/vm2api-quota/menubar.json  { base_url, api_key, panel_token }
+//   ~/.config/vm2api-quota/menubar.json
+//   { base_url, api_key, panel_token, show_7d }
 //
 // Build:  menubar/build.sh        Run:  menubar/bin/VmQuotaBar  (or build.sh --app)
 
@@ -48,6 +49,7 @@ struct GatewayConfig {
     var baseURL: String
     var apiKey: String
     var panelToken: String
+    var show7d: Bool
     var configPath: String
 
     static var path: String { NSHomeDirectory() + "/.config/vm2api-quota/menubar.json" }
@@ -62,16 +64,18 @@ struct GatewayConfig {
         return GatewayConfig(baseURL: base,
                              apiKey: asStr(cfg["api_key"]) ?? "",
                              panelToken: asStr(cfg["panel_token"]) ?? "",
+                             show7d: cfg["show_7d"] as? Bool ?? true,
                              configPath: path)
     }
 
-    static func save(baseURL: String, apiKey: String, panelToken: String) -> Bool {
+    static func save(baseURL: String, apiKey: String, panelToken: String, show7d: Bool) -> Bool {
         let trimmed = { (s: String) in s.trimmingCharacters(in: .whitespacesAndNewlines) }
         var base = trimmed(baseURL)
         while base.hasSuffix("/") { base = String(base.dropLast()) }
-        let obj: [String: String] = ["base_url": base,
-                                      "api_key": trimmed(apiKey),
-                                      "panel_token": trimmed(panelToken)]
+        let obj: [String: Any] = ["base_url": base,
+                                  "api_key": trimmed(apiKey),
+                                  "panel_token": trimmed(panelToken),
+                                  "show_7d": show7d]
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) else { return false }
         let dir = (path as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
@@ -84,10 +88,10 @@ struct GatewayConfig {
 // MARK: - Snapshot models
 
 struct WindowInfo {
-    var pct: Int = 0
-    var status: String = "unknown"
+    var pct = 0                 // usage percent
+    var status = "unknown"
     var resetsAt: Double?
-    var resetsText: String = "n/a"
+    var resetsText = "n/a"      // "MM-dd HH:mm (in 44m)"
 
     mutating func parse(_ d: [String: Any]?) {
         guard let d = d else { return }
@@ -99,28 +103,34 @@ struct WindowInfo {
 
     static func resetText(_ epoch: Double?) -> String {
         guard let epoch = epoch else { return "n/a" }
-        let rel = epoch - Date().timeIntervalSince1970
         let df = DateFormatter()
         df.dateFormat = "MM-dd HH:mm"
-        let human = df.string(from: Date(timeIntervalSince1970: epoch))
-        if rel <= 0 { return "\(human) (active)" }
-        let m = Int(rel) / 60
-        let relTxt = m >= 60 ? "in \(m / 60)h\(m % 60)m" : "in \(m)m"
-        return "\(human) (\(relTxt))"
+        return "\(df.string(from: Date(timeIntervalSince1970: epoch))) (\(resetShort(epoch)))"
+    }
+
+    /// Short countdown like "2h 47m", "44m", "6d 3h", "active".
+    static func resetShort(_ epoch: Double?) -> String {
+        guard let epoch = epoch else { return "—" }
+        let rel = Int(epoch - Date().timeIntervalSince1970)
+        if rel <= 0 { return "active" }
+        let d = rel / 86400, h = (rel % 86400) / 3600, m = (rel % 3600) / 60
+        if d > 0 { return "\(d)d \(h)h" }
+        if h > 0 { return "\(h)h \(m)m" }
+        return "\(m)m"
     }
 }
 
 struct PoolAccount {
     var id = "", name = "", status5 = "unknown", status7 = "unknown"
     var u5 = 0, u7 = 0
-    var r5Text = "n/a", r7Text = "n/a"
+    var r5: Double?, r7: Double?
     var est5 = "", est7 = ""
 }
 
 struct BillingInfo {
     var source = "", currency = "USD"
     var today = "", todayReq = "", todaySince = ""
-    var w5 = "", w5Req = "", w5Since = ""
+    var w5 = "", w5Req = ""
     var total = "", totalReq = ""
 }
 
@@ -205,8 +215,8 @@ enum Fetcher {
                 a.u7 = Int((asNum(v["utilization_7d"]) ?? 0) * 100)
                 a.status5 = asStr(v["status_5h"]) ?? "unknown"
                 a.status7 = asStr(v["status_7d"]) ?? "unknown"
-                a.r5Text = WindowInfo.resetText(asNum(v["reset_5h"]))
-                a.r7Text = WindowInfo.resetText(asNum(v["reset_7d"]))
+                a.r5 = asNum(v["reset_5h"])
+                a.r7 = asNum(v["reset_7d"])
                 a.est5 = est(v, "estimate_5h"); a.est7 = est(v, "estimate_7d")
                 s.pool.append(a)
             }
@@ -226,7 +236,6 @@ enum Fetcher {
             s.billing.totalReq = intStr(asNum(total?["requests"]))
             if let billingRoot = asDict(bill) {
                 s.billing.todaySince = asStr(billingRoot["today_start"]) ?? ""
-                s.billing.w5Since = asStr(billingRoot["window_5h_start"]) ?? ""
             }
         }
 
@@ -269,8 +278,6 @@ enum Fetcher {
         q.duration = "p50 \(ms(asNum(dur?["p50_ms"]))) · p95 \(ms(asNum(dur?["p95_ms"]))) · avg \(ms(asNum(dur?["avg_ms"])))"
         let qps = asDict(w["qps"]), tps = asDict(w["tps"])
         q.qps = "cur \(String(format: "%.3f", asNum(qps?["current"]) ?? 0)) · peak \(String(format: "%.3f", asNum(qps?["peak"]) ?? 0))"
-        let tpsIn = asNum(w["input_tokens"]) ?? 0, tpsOut = asNum(w["output_tokens"]) ?? 0
-        _ = (tpsIn, tpsOut)
         q.tps = "cur \(String(format: "%.1f", asNum(tps?["current"]) ?? 0)) · peak \(String(format: "%.1f", asNum(tps?["peak"]) ?? 0))"
         if let c = asNum(w["cache_hit_rate"]) { q.cache = String(format: "%.1f%%", c * 100) }
         if let st = asDict(w["sticky"]) {
@@ -292,7 +299,7 @@ enum Fetcher {
     }
 }
 
-// MARK: - Severity colors
+// MARK: - Severity (usage semantics: high usage = bad)
 
 enum Severity {
     static func color(forPct pct: Int, status: String) -> NSColor {
@@ -332,8 +339,8 @@ final class AppState: ObservableObject {
     }
 
     /// Save the settings form, reload config, and refresh immediately.
-    func saveConfig(baseURL: String, apiKey: String, panelToken: String) -> Bool {
-        guard GatewayConfig.save(baseURL: baseURL, apiKey: apiKey, panelToken: panelToken) else { return false }
+    func saveConfig(baseURL: String, apiKey: String, panelToken: String, show7d: Bool) -> Bool {
+        guard GatewayConfig.save(baseURL: baseURL, apiKey: apiKey, panelToken: panelToken, show7d: show7d) else { return false }
         cfg = GatewayConfig.load()
         refresh()
         return true
@@ -353,43 +360,35 @@ final class AppState: ObservableObject {
     }
 }
 
-// MARK: - Menu bar title
+// MARK: - Menu bar title (numbers only, severity colors; 7d toggleable)
 
 enum BarTitle {
-    /// Vertical level glyph (▁▂▃▄▅▆▇█): fill height tracks the percentage, like
-    /// a signal-strength bar. One glyph wide, so the menu-bar item stays narrow
-    /// and notch-safe (horizontal bars get clipped by the camera cutout).
-    static func vBar(_ pct: Int) -> String {
-        let levels = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
-        let idx = max(0, min(7, Int((Double(max(0, min(100, pct))) / 100.0 * 8.0).rounded())))
-        return levels[idx]
-    }
-
-    static func attributed(_ snap: Snapshot) -> NSAttributedString {
+    static func attributed(_ snap: Snapshot, show7d: Bool) -> NSAttributedString {
         let out = NSMutableAttributedString()
         let mono = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
         let baseColor = NSColor.labelColor
 
-        func add(_ s: String, _ f: NSFont, _ c: NSColor) {
-            out.append(NSAttributedString(string: s, attributes: [.font: f, .foregroundColor: c]))
+        func add(_ s: String, _ c: NSColor) {
+            out.append(NSAttributedString(string: s, attributes: [.font: mono, .foregroundColor: c]))
         }
 
         guard snap.ok else {
             if snap.error.isEmpty {
-                add("…", mono, baseColor) // initial load in progress
+                add("…", baseColor) // initial load in progress
             } else {
-                add("⚠", mono, .systemRed)
+                add("⚠", .systemRed)
             }
             return out
         }
-        // "98█ 18▃" — 5h first, then 7d; which-is-which lives in the tooltip
-        for w in [snap.w5, snap.w7] {
+        // "98 58" — 5h first, then 7d (optional); which-is-which lives in the tooltip
+        let windows = show7d ? [snap.w5, snap.w7] : [snap.w5]
+        for (i, w) in windows.enumerated() {
             let c = Severity.color(forPct: w.pct, status: w.status)
-            add("\(w.pct)", mono, c)
-            add(vBar(w.pct) + " ", mono, c)
+            add("\(w.pct)", c)
+            if i < windows.count - 1 { add(" ", baseColor) }
         }
-        if Severity.isWarn(snap.w5.status) || Severity.isWarn(snap.w7.status) {
-            add("⚠", mono, .systemOrange)
+        if Severity.isWarn(snap.w5.status) || (show7d && Severity.isWarn(snap.w7.status)) {
+            add(" ⚠", .systemOrange)
         }
         return out
     }
@@ -397,55 +396,57 @@ enum BarTitle {
 
 // MARK: - Popover UI
 
-struct WindowRow: View {
-    let label: String
-    let w: WindowInfo
+/// Big usage card: the number and the bar fill both mean USAGE (red = close to the limit).
+struct QuotaCard: View {
+    let title: String
+    let usedPct: Int
+    let status: String
+    let resetText: String
     var est: String = ""
 
+    private var color: Color { Color(Severity.color(forPct: usedPct, status: status)) }
+
     var body: some View {
-        HStack(spacing: 8) {
-            Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 28, alignment: .leading)
-            ProgressView(value: Double(min(w.pct, 100)), total: 100)
-                .progressViewStyle(.linear)
-                .tint(Color(Severity.color(forPct: w.pct, status: w.status)))
-                .frame(width: 130)
-            Text("\(w.pct)%").font(.system(.callout, design: .monospaced).weight(.semibold))
-                .frame(width: 44, alignment: .trailing)
-            Text(Severity.tag(w.status))
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(Color(Severity.color(forPct: w.pct, status: w.status)))
-                .frame(width: 64, alignment: .leading)
-            VStack(alignment: .leading, spacing: 0) {
-                Text("resets " + w.resetsText).font(.caption2).foregroundStyle(.secondary)
-                if !est.isEmpty { Text("est " + est).font(.caption2).foregroundStyle(.secondary) }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(title).font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Text("resets " + resetText)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
             }
-            Spacer(minLength: 0)
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                Text("\(usedPct)%")
+                    .font(.system(size: 26, weight: .bold))
+                    .monospacedDigit()
+                    .foregroundStyle(color)
+                Text("used")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(100 - usedPct)% left")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(.quaternary)
+                    Capsule().fill(color)
+                        .frame(width: geo.size.width * min(max(Double(usedPct), 0), 100) / 100)
+                }
+            }
+            .frame(height: 7)
+            if !est.isEmpty {
+                Text("est " + est)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+            }
         }
-        .padding(.vertical, 1)
-    }
-}
-
-struct SectionHeader: View {
-    let title: String
-    let subtitle: String
-    var body: some View {
-        HStack {
-            Text(title).font(.caption.weight(.bold)).foregroundStyle(.secondary)
-            Spacer()
-            Text(subtitle).font(.caption2).foregroundStyle(.tertiary)
-        }
-        .padding(.top, 8)
-    }
-}
-
-struct QoSRow: View {
-    let label: String, value: String
-    var body: some View {
-        HStack(alignment: .top) {
-            Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 108, alignment: .leading)
-            Text(value).font(.system(.caption, design: .monospaced))
-            Spacer(minLength: 0)
-        }
+        .padding(12)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
     }
 }
 
@@ -454,12 +455,13 @@ struct SettingsForm: View {
     @State private var base = ""
     @State private var key = ""
     @State private var panel = ""
+    @State private var show7d = true
     @State private var saved = false
     @State private var failed = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("SETTINGS").font(.caption.weight(.bold)).foregroundStyle(.secondary)
+            Text("SETTINGS").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
             TextField("Gateway URL (e.g. http://192.0.2.10:8787)", text: $base)
                 .textFieldStyle(.roundedBorder)
                 .font(.system(.callout, design: .monospaced))
@@ -470,9 +472,11 @@ struct SettingsForm: View {
             SecureField("Panel token (optional — a master key already covers it)", text: $panel)
                 .textFieldStyle(.roundedBorder)
                 .font(.system(.callout, design: .monospaced))
+            Toggle("Show 7d in the menu bar", isOn: $show7d)
+                .font(.system(size: 11))
             HStack {
                 Button("Save & Refresh") {
-                    if state.saveConfig(baseURL: base, apiKey: key, panelToken: panel) {
+                    if state.saveConfig(baseURL: base, apiKey: key, panelToken: panel, show7d: show7d) {
                         saved = true; failed = false
                     } else {
                         failed = true; saved = false
@@ -481,15 +485,43 @@ struct SettingsForm: View {
                 if saved { Text("saved ✓").font(.caption).foregroundStyle(.green) }
                 if failed { Text("save failed").font(.caption).foregroundStyle(.red) }
                 Spacer()
-                Text(state.cfg.configPath).font(.caption2).foregroundStyle(.tertiary)
+                Text(state.cfg.configPath).font(.system(size: 10)).foregroundStyle(.tertiary)
             }
         }
-        .padding(8)
+        .padding(10)
         .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
         .onAppear {
             base = state.cfg.baseURL
             key = state.cfg.apiKey
             panel = state.cfg.panelToken
+            show7d = state.cfg.show7d
+        }
+    }
+}
+
+struct DetailRow: View {
+    let label: String, value: String
+    var body: some View {
+        HStack(alignment: .top) {
+            Text(label).font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 100, alignment: .leading)
+            Text(value).font(.system(size: 11, design: .monospaced))
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+struct SectionLabel: View {
+    let title: String
+    var trailing: String = ""
+    var body: some View {
+        HStack {
+            Text(title).font(.system(size: 12, weight: .semibold))
+            Spacer()
+            if !trailing.isEmpty {
+                Text(trailing)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }
@@ -497,117 +529,237 @@ struct SettingsForm: View {
 struct PanelView: View {
     @EnvironmentObject var state: AppState
     @State private var showSettings = false
-    private let fixed: CGFloat = 460
+    private let width: CGFloat = 440
 
+    private var s: Snapshot { state.snap }
     private var configured: Bool { !state.cfg.baseURL.isEmpty }
 
+    private var health: (String, Color) {
+        guard s.ok else { return ("Error", .red) }
+        if s.w5.status == "blocked" || s.w7.status == "blocked" { return ("Blocked", .red) }
+        if Severity.isWarn(s.w5.status) || Severity.isWarn(s.w7.status) { return ("Warning", .orange) }
+        return ("Healthy", .green)
+    }
+
     var body: some View {
-        let s = state.snap
         ScrollView {
-            VStack(alignment: .leading, spacing: 4) {
-                // header
-                HStack {
-                    Text("vm2api quota").font(.headline)
-                    Text(configured ? state.cfg.baseURL : "(not configured)")
-                        .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
-                    Spacer()
-                    if state.refreshing { ProgressView().controlSize(.small) }
-                    Button {
-                        showSettings.toggle()
-                    } label: {
-                        Image(systemName: "gearshape")
-                    }
-                    .controlSize(.small)
-                    .help("Settings")
-                    Button("Refresh") { state.refresh() }.controlSize(.small)
-                }
-                if showSettings || !configured {
-                    SettingsForm()
-                }
+            VStack(spacing: 0) {
+                header
+                if showSettings || !configured { SettingsForm().padding(.top, 10) }
                 if !s.ok {
-                    Text(configured ? s.error : "Welcome — enter your gateway URL and API key above, then Save.")
-                        .font(.callout).foregroundStyle(.red).padding(.top, 4)
+                    Text(configured ? s.error : "Enter your gateway URL and API key above, then Save.")
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .padding(.top, 8)
                 } else {
-                    // current account
-                    SectionHeader(title: "CURRENT ACCOUNT", subtitle: "platform \(s.platform) · source \(s.source)")
-                    WindowRow(label: "5h", w: s.w5)
-                    WindowRow(label: "7d", w: s.w7)
-
-                    // pool
-                    SectionHeader(title: "PER-ACCOUNT POOL",
-                                  subtitle: s.hasPanel ? "\(s.pool.count) account(s)" : "no panel credential")
-                    if s.hasPanel {
-                        ForEach(s.pool.indices, id: \.self) { i in
-                            let a = s.pool[i]
-                            VStack(alignment: .leading, spacing: 0) {
-                                Text("\(a.id) (\(a.name))").font(.caption.weight(.semibold)).padding(.top, 2)
-                                WindowRow(label: "5h", w: WindowInfo(pct: a.u5, status: a.status5, resetsAt: nil, resetsText: a.r5Text), est: a.est5)
-                                WindowRow(label: "7d", w: WindowInfo(pct: a.u7, status: a.status7, resetsAt: nil, resetsText: a.r7Text), est: a.est7)
-                            }
-                        }
-                        if s.pool.isEmpty { Text("no rows in /api/panel/vms").font(.caption2).foregroundStyle(.tertiary) }
+                    Divider().padding(.vertical, 12)
+                    cards
+                    if s.pool.count > 1 {
+                        Divider().padding(.vertical, 12)
+                        poolSection
                     }
+                    Divider().padding(.vertical, 12)
+                    billingSection
+                    Divider().padding(.vertical, 12)
+                    qosSection
+                }
+                footer
+            }
+            .padding(16)
+            .frame(width: width)
+        }
+        .frame(width: width, height: 470)
+    }
 
-                    // billing
-                    SectionHeader(title: "BILLING", subtitle: s.hasPanel ? "\(s.billing.source) (\(s.billing.currency))" : "no panel credential")
-                    if s.hasPanel {
-                        QoSRow(label: "today", value: "\(s.billing.today) · \(s.billing.todayReq) req · since \(s.billing.todaySince)")
-                        QoSRow(label: "5h window", value: "\(s.billing.w5) · \(s.billing.w5Req) req")
-                        QoSRow(label: "7d window", value: "\(s.billing.total) · \(s.billing.totalReq) req")
+    // MARK: header
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("VM2API QUOTA")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Text(s.platform.isEmpty ? "gateway" : s.platform.capitalized)
+                    .font(.system(size: 18, weight: .bold))
+            }
+            Spacer()
+            HStack(spacing: 5) {
+                Circle().fill(health.1).frame(width: 6, height: 6)
+                Text(health.0).font(.system(size: 11, weight: .medium))
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(health.1.opacity(0.10))
+            .clipShape(Capsule())
+
+            if state.refreshing { ProgressView().controlSize(.small) }
+            Button { state.refresh() } label: { Image(systemName: "arrow.clockwise") }
+                .buttonStyle(.borderless).help("Refresh")
+            Button { showSettings.toggle() } label: { Image(systemName: "gearshape") }
+                .buttonStyle(.borderless).help("Settings")
+        }
+    }
+
+    // MARK: usage cards
+
+    private var cards: some View {
+        VStack(spacing: 10) {
+            // pool of one: that account IS the current account — surface its estimates
+            let single = s.pool.count == 1 ? s.pool[0] : nil
+            QuotaCard(title: "5-hour usage",
+                      usedPct: s.w5.pct,
+                      status: s.w5.status,
+                      resetText: WindowInfo.resetShort(s.w5.resetsAt),
+                      est: single?.est5 ?? "")
+            QuotaCard(title: "7-day usage",
+                      usedPct: s.w7.pct,
+                      status: s.w7.status,
+                      resetText: WindowInfo.resetShort(s.w7.resetsAt),
+                      est: single?.est7 ?? "")
+            if !s.hasPanel {
+                Text("pool · billing · QoS need a panel credential — add one in settings ⚙")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    // MARK: pool (only when more than one account)
+
+    private var poolSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SectionLabel(title: "Pool", trailing: "\(s.pool.count) accounts")
+            ForEach(s.pool.indices, id: \.self) { i in
+                let a = s.pool[i]
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text("\(a.id) (\(a.name))").font(.system(size: 12, weight: .medium))
+                        Spacer()
+                        Text("5h \(a.u5)%")
+                            .font(.system(size: 12, design: .monospaced).weight(.semibold))
+                            .foregroundStyle(Color(Severity.color(forPct: a.u5, status: a.status5)))
+                        Text("7d \(a.u7)%")
+                            .font(.system(size: 12, design: .monospaced).weight(.semibold))
+                            .foregroundStyle(Color(Severity.color(forPct: a.u7, status: a.status7)))
+                        Text(Severity.tag(a.status5))
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(Color(Severity.color(forPct: a.u5, status: a.status5)))
                     }
+                    Text("resets \(WindowInfo.resetShort(a.r5)) / \(WindowInfo.resetShort(a.r7))"
+                         + (a.est5.isEmpty ? "" : " · est \(a.est5) / \(a.est7)"))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .monospacedDigit()
+                }
+                .padding(.vertical, 2)
+            }
+        }
+    }
 
-                    // quality of service
-                    SectionHeader(title: "QUALITY OF SERVICE", subtitle: s.hasPanel ? "last 1 hour · \(s.qos.samples) samples" : "no panel credential")
-                    if s.hasPanel {
-                        if s.qos.samples == 0 {
-                            Text("no samples in the last hour").font(.caption2).foregroundStyle(.tertiary)
-                        } else {
-                            QoSRow(label: "success rate", value: String(format: "%.1f%%", s.qos.successPct))
-                            QoSRow(label: "error rate", value: String(format: "%.1f%% · 429:%d 503:%d 529:%d", s.qos.errorPct, s.qos.c429, s.qos.c503, s.qos.c529))
-                            QoSRow(label: "first byte", value: s.qos.ttft)
-                            QoSRow(label: "duration", value: s.qos.duration)
-                            QoSRow(label: "qps", value: s.qos.qps)
-                            QoSRow(label: "tps", value: s.qos.tps)
-                            if !s.qos.cache.isEmpty { QoSRow(label: "cache hit", value: s.qos.cache) }
-                            if !s.qos.sticky.isEmpty { QoSRow(label: "sticky sessions", value: s.qos.sticky) }
-                            if !s.qos.models.isEmpty {
-                                VStack(spacing: 0) {
+    // MARK: billing
+
+    private var billingSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionLabel(title: "Billing",
+                         trailing: "\(s.billing.source) · \(s.billing.currency)".uppercased())
+            HStack(alignment: .firstTextBaseline) {
+                Text("Today").font(.system(size: 12)).foregroundStyle(.secondary)
+                Text("\(s.billing.todayReq) req")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary).monospacedDigit()
+                Spacer()
+                Text(s.billing.today)
+                    .font(.system(size: 20, weight: .semibold))
+                    .monospacedDigit()
+            }
+            billingRow(title: "5h window", amount: s.billing.w5, requests: s.billing.w5Req)
+            billingRow(title: "7d window", amount: s.billing.total, requests: s.billing.totalReq)
+        }
+    }
+
+    private func billingRow(title: String, amount: String, requests: String) -> some View {
+        HStack {
+            Text(title).font(.system(size: 11)).foregroundStyle(.secondary)
+            Spacer()
+            Text(amount).font(.system(size: 11)).monospacedDigit()
+            Text("·").font(.system(size: 11)).foregroundStyle(.tertiary)
+            Text(requests + " req").font(.system(size: 11)).foregroundStyle(.secondary).monospacedDigit()
+        }
+    }
+
+    // MARK: quality of service
+
+    private var qosSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "waveform.path")
+                    .font(.system(size: 14))
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Quality of Service").font(.system(size: 12, weight: .semibold))
+                    Text(s.qos.samples == 0 ? "No samples in the last hour" : "last 1 hour")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if s.qos.samples > 0 {
+                    Text(String(format: "%.1f%% ok", s.qos.successPct))
+                        .font(.system(size: 11, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(s.qos.successPct >= 99 ? .green : .orange)
+                }
+            }
+            if s.qos.samples > 0 {
+                DisclosureGroup("Details") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        DetailRow(label: "error rate", value: String(format: "%.1f%% · 429:%d 503:%d 529:%d", s.qos.errorPct, s.qos.c429, s.qos.c503, s.qos.c529))
+                        DetailRow(label: "first byte", value: s.qos.ttft)
+                        DetailRow(label: "duration", value: s.qos.duration)
+                        DetailRow(label: "qps", value: s.qos.qps)
+                        DetailRow(label: "tps", value: s.qos.tps)
+                        if !s.qos.cache.isEmpty { DetailRow(label: "cache hit", value: s.qos.cache) }
+                        if !s.qos.sticky.isEmpty { DetailRow(label: "sticky sessions", value: s.qos.sticky) }
+                        if !s.qos.models.isEmpty {
+                            VStack(spacing: 1) {
+                                HStack {
+                                    Text("model").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).frame(width: 76, alignment: .leading)
+                                    Text("req").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).frame(width: 48, alignment: .trailing)
+                                    Text("err").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).frame(width: 34, alignment: .trailing)
+                                    Text("ttft").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).frame(width: 58, alignment: .trailing)
+                                    Text("dur").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).frame(width: 58, alignment: .trailing)
+                                    Spacer(minLength: 0)
+                                }
+                                ForEach(s.qos.models.indices, id: \.self) { j in
+                                    let m = s.qos.models[j]
                                     HStack {
-                                        Text("model").font(.caption2.weight(.bold)).foregroundStyle(.secondary).frame(width: 80, alignment: .leading)
-                                        Text("req").font(.caption2.weight(.bold)).foregroundStyle(.secondary).frame(width: 56, alignment: .trailing)
-                                        Text("err").font(.caption2.weight(.bold)).foregroundStyle(.secondary).frame(width: 40, alignment: .trailing)
-                                        Text("ttft").font(.caption2.weight(.bold)).foregroundStyle(.secondary).frame(width: 64, alignment: .trailing)
-                                        Text("dur").font(.caption2.weight(.bold)).foregroundStyle(.secondary).frame(width: 64, alignment: .trailing)
+                                        Text(m.name).font(.system(size: 10, design: .monospaced)).frame(width: 76, alignment: .leading)
+                                        Text(m.req).font(.system(size: 10, design: .monospaced)).frame(width: 48, alignment: .trailing)
+                                        Text(m.err).font(.system(size: 10, design: .monospaced)).frame(width: 34, alignment: .trailing)
+                                        Text(m.ttft).font(.system(size: 10, design: .monospaced)).frame(width: 58, alignment: .trailing)
+                                        Text(m.dur).font(.system(size: 10, design: .monospaced)).frame(width: 58, alignment: .trailing)
                                         Spacer(minLength: 0)
                                     }
-                                    ForEach(s.qos.models.indices, id: \.self) { i in
-                                        let m = s.qos.models[i]
-                                        HStack {
-                                            Text(m.name).font(.system(.caption2, design: .monospaced)).frame(width: 80, alignment: .leading)
-                                            Text(m.req).font(.system(.caption2, design: .monospaced)).frame(width: 56, alignment: .trailing)
-                                            Text(m.err).font(.system(.caption2, design: .monospaced)).frame(width: 40, alignment: .trailing)
-                                            Text(m.ttft).font(.system(.caption2, design: .monospaced)).frame(width: 64, alignment: .trailing)
-                                            Text(m.dur).font(.system(.caption2, design: .monospaced)).frame(width: 64, alignment: .trailing)
-                                            Spacer(minLength: 0)
-                                        }
-                                    }
-                                }.padding(.top, 2)
-                            }
+                                }
+                            }.padding(.top, 4)
                         }
                     }
                 }
-
-                // footer
-                HStack {
-                    Text("config: \(state.cfg.configPath)").font(.caption2).foregroundStyle(.tertiary)
-                    Spacer()
-                    Text("updated \(timeStr(s.updatedAt))").font(.caption2).foregroundStyle(.tertiary)
-                }.padding(.top, 10)
+                .font(.system(size: 11))
             }
-            .padding(12)
-            .frame(minWidth: fixed + 60, alignment: .leading)
         }
-        .frame(width: fixed + 60, height: 560)
+    }
+
+    // MARK: footer
+
+    private var footer: some View {
+        HStack {
+            Text("vm2api-quota").font(.system(size: 10)).foregroundStyle(.tertiary)
+            Spacer()
+            Text("updated " + timeStr(s.updatedAt))
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .monospacedDigit()
+        }
+        .padding(.top, 16)
     }
 
     private func timeStr(_ d: Date) -> String {
@@ -636,9 +788,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         popover = NSPopover()
         popover.behavior = .transient
+        popover.contentSize = NSSize(width: 440, height: 470)
         popover.contentViewController = NSHostingController(
             rootView: PanelView().environmentObject(state))
-        popover.contentSize = NSSize(width: 520, height: 560)
 
         monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             self?.popover.close()
@@ -653,14 +805,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func renderTitle() {
-        statusItem.button?.attributedTitle = BarTitle.attributed(state.snap)
+        statusItem.button?.attributedTitle = BarTitle.attributed(state.snap, show7d: state.cfg.show7d)
         let s = state.snap
         statusItem.button?.toolTip = s.ok
             ? "vm2api quota — 5h \(s.w5.pct)% · 7d \(s.w7.pct)%"
             : "vm2api quota — not configured / error"
         if ProcessInfo.processInfo.environment["VMQUOTA_DEBUG_TITLE"] == "1" {
             let plain = s.ok
-                ? "ok: \(s.w5.pct)\(BarTitle.vBar(s.w5.pct)) \(s.w7.pct)\(BarTitle.vBar(s.w7.pct)) · pool \(s.pool.count) · qos \(s.qos.samples) samples"
+                ? "ok: \(s.w5.pct) \(state.cfg.show7d ? "\(s.w7.pct)" : "(7d hidden)") · pool \(s.pool.count) · qos \(s.qos.samples) samples"
                 : "not ok: \(s.error.isEmpty ? "loading" : s.error)"
             fputs("[VmQuotaBar title] " + plain + "\n", stderr)
         }
