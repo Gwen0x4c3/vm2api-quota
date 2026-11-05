@@ -52,6 +52,25 @@ The input is intercepted and executed locally: the report prints to your termina
      7d win  $136.05  (966 req)
 ```
 
+## macOS menu bar app (bonus)
+
+`menubar/` holds a **native SwiftUI menu-bar app** (single file, no Xcode project) that shows quota at a glance, iStat-style:
+
+- **Menu bar**: `Q 5h 98 ▮▮▮▮▮ 7d 58 ▮▮▯▯▯` — mini bars + numbers, colored by severity (green → yellow → orange → red, `⚠` on WARN/BLOCKED).
+- **Click** opens a dashboard popover: current account, per-account pool (with USD estimates), billing, and **Quality of Service** — success/error rate with 429/503/529 counts, TTFT and duration percentiles, QPS/TPS, cache hit rate, sticky sessions, and per-model rows (same `/api/panel/request-logs/stats` last-hour window the console overview renders).
+- Auto-refresh every 60 s, manual refresh button, read-only GETs only.
+- Reuses the plugin's configuration (`~/.claude/vm2api-quota-config.json`, then env vars, then `settings.json`) — zero extra setup if `/quota` already works.
+
+```sh
+cd menubar
+./build.sh                    # -> bin/VmQuotaBar
+./bin/VmQuotaBar              # run directly
+./build.sh --app              # or build a proper .app bundle
+open bin/VmQuotaBar.app       #   and launch it (login item: add in System Settings)
+```
+
+Requires Xcode Command Line Tools (`xcode-select --install`).
+
 ## Manage
 
 ```

@@ -1,0 +1,629 @@
+// VmQuotaBar.swift — a native macOS menu-bar app (single file, no Xcode project)
+// showing vm2api gateway quota at a glance.
+//
+//   Menu bar : "Q 5h 98 ▮▮▮▮▮  7d 58 ▮▮▯▯▯"  (mini bars + numbers, severity colors)
+//   Click    : popover dashboard — current account, per-account pool (with USD
+//              estimates), billing, and Quality of Service (success rate,
+//              429/503/529, TTFT/duration percentiles, QPS/TPS, cache hit,
+//              sticky scheduling, per-model rows).
+//
+// Data (read-only GETs, same endpoints as the vm2api-quota plugin):
+//   GET {base}/v1/usage?unit=percent_used                       (API key)
+//   GET {base}/api/panel/vms                                    (panel credential)
+//   GET {base}/api/panel/usage                                  (panel credential)
+//   GET {base}/api/panel/request-logs/stats?bucket=hour&since=… (panel credential)
+//
+// Config resolution (identical to scripts/quota.sh):
+//   1. ~/.claude/vm2api-quota-config.json  { base_url, api_key, panel_token }
+//   2. CLAUDE_PLUGIN_OPTION_BASE_URL / _MASTER_KEY / _PANEL_TOKEN env
+//   3. VM2API_BASE_URL / ANTHROPIC_BASE_URL, VM2API_API_KEY / ANTHROPIC_AUTH_TOKEN /
+//      ANTHROPIC_API_KEY, VM2API_PANEL_TOKEN env
+//   4. env.ANTHROPIC_BASE_URL / _AUTH_TOKEN / _API_KEY in ~/.claude/settings.json
+//      (then ~/.zcode/settings.json)
+//   No default gateway URL: without configuration the app shows a setup hint.
+//
+// Build:  menubar/build.sh        Run:  menubar/bin/VmQuotaBar  (or build.sh --app)
+
+import AppKit
+import Combine
+import SwiftUI
+
+// MARK: - JSON helpers
+
+private func asDict(_ x: Any?) -> [String: Any]? { x as? [String: Any] }
+private func asArr(_ x: Any?) -> [Any]? { x as? [Any] }
+private func asNum(_ x: Any?) -> Double? {
+    if let n = x as? NSNumber { return n.doubleValue }
+    if let s = x as? String { return Double(s) }
+    return nil
+}
+private func asStr(_ x: Any?) -> String? { x as? String }
+private func dig(_ d: [String: Any]?, _ path: String...) -> Any? {
+    var cur: Any? = d
+    for k in path {
+        cur = asDict(cur)?[k]
+        if cur == nil { return nil }
+    }
+    return cur
+}
+
+// MARK: - Config
+
+struct GatewayConfig {
+    var baseURL: String
+    var apiKey: String
+    var panelToken: String
+    var configPath: String
+
+    static func load() -> GatewayConfig {
+        let home = NSHomeDirectory()
+        let fm = FileManager.default
+        let env = ProcessInfo.processInfo.environment
+
+        // 1. plugin runtime config file
+        let cfgPath = home + "/.claude/vm2api-quota-config.json"
+        var cfg: [String: Any] = [:]
+        if let data = fm.contents(atPath: cfgPath) {
+            cfg = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        }
+        // 4. settings.json env fallbacks
+        var settingsEnv: [String: String] = [:]
+        for p in [home + "/.claude/settings.json", home + "/.zcode/settings.json"] {
+            if let data = fm.contents(atPath: p),
+               let j = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               let e = j["env"] as? [String: Any] {
+                settingsEnv = e.compactMapValues { $0 as? String }
+                if !settingsEnv.isEmpty { break }
+            }
+        }
+        let fileBase = asStr(cfg["base_url"]) ?? ""
+        let fileKey = asStr(cfg["api_key"]) ?? ""
+        let filePanel = asStr(cfg["panel_token"]) ?? ""
+        let opt = { (k: String) in env["CLAUDE_PLUGIN_OPTION_" + k] ?? "" }
+
+        let base = firstNonEmpty(fileBase,
+                                 opt("BASE_URL"),
+                                 env["VM2API_BASE_URL"] ?? "", env["ANTHROPIC_BASE_URL"] ?? "",
+                                 settingsEnv["ANTHROPIC_BASE_URL"] ?? "")
+        let key = firstNonEmpty(fileKey,
+                                opt("MASTER_KEY"),
+                                env["VM2API_API_KEY"] ?? "",
+                                env["ANTHROPIC_AUTH_TOKEN"] ?? "", env["ANTHROPIC_API_KEY"] ?? "",
+                                settingsEnv["ANTHROPIC_AUTH_TOKEN"] ?? "", settingsEnv["ANTHROPIC_API_KEY"] ?? "")
+        // panel: dedicated credential first, then the master key (works on panel routes)
+        let panel = firstNonEmpty(opt("PANEL_TOKEN"),
+                                  env["VM2API_PANEL_TOKEN"] ?? "",
+                                  filePanel,
+                                  fileKey, opt("MASTER_KEY"), env["VM2API_API_KEY"] ?? "")
+        return GatewayConfig(baseURL: base.hasSuffix("/") ? String(base.dropLast()) : base,
+                             apiKey: key, panelToken: panel, configPath: cfgPath)
+    }
+}
+
+private func firstNonEmpty(_ s: String...) -> String {
+    for x in s where !x.isEmpty { return x }
+    return ""
+}
+
+// MARK: - Snapshot models
+
+struct WindowInfo {
+    var pct: Int = 0
+    var status: String = "unknown"
+    var resetsAt: Double?
+    var resetsText: String = "n/a"
+
+    mutating func parse(_ d: [String: Any]?) {
+        guard let d = d else { return }
+        pct = Int(asNum(d["utilization"]) ?? 0)
+        status = asStr(d["status"]) ?? "unknown"
+        if let r = asNum(d["resets_at"]) { resetsAt = r }
+        resetsText = Self.resetText(resetsAt)
+    }
+
+    static func resetText(_ epoch: Double?) -> String {
+        guard let epoch = epoch else { return "n/a" }
+        let rel = epoch - Date().timeIntervalSince1970
+        let df = DateFormatter()
+        df.dateFormat = "MM-dd HH:mm"
+        let human = df.string(from: Date(timeIntervalSince1970: epoch))
+        if rel <= 0 { return "\(human) (active)" }
+        let m = Int(rel) / 60
+        let relTxt = m >= 60 ? "in \(m / 60)h\(m % 60)m" : "in \(m)m"
+        return "\(human) (\(relTxt))"
+    }
+}
+
+struct PoolAccount {
+    var id = "", name = "", status5 = "unknown", status7 = "unknown"
+    var u5 = 0, u7 = 0
+    var r5Text = "n/a", r7Text = "n/a"
+    var est5 = "", est7 = ""
+}
+
+struct BillingInfo {
+    var source = "", currency = "USD"
+    var today = "", todayReq = "", todaySince = ""
+    var w5 = "", w5Req = "", w5Since = ""
+    var total = "", totalReq = ""
+}
+
+struct QoSInfo {
+    var samples = 0
+    var successPct = 0.0, errorPct = 0.0
+    var c429 = 0, c503 = 0, c529 = 0
+    var ttft = "", duration = "", qps = "", tps = "", cache = "", sticky = ""
+    var models: [(name: String, req: String, err: String, ttft: String, dur: String)] = []
+}
+
+struct Snapshot {
+    var ok = false
+    var error = ""
+    var platform = "", source = ""
+    var w5 = WindowInfo(), w7 = WindowInfo()
+    var pool: [PoolAccount] = []
+    var billing = BillingInfo()
+    var qos = QoSInfo()
+    var hasPanel = false
+    var updatedAt = Date.distantPast
+}
+
+// MARK: - Fetcher (read-only GETs, no system proxy)
+
+enum Fetcher {
+    private static let session: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.timeoutIntervalForRequest = 15
+        c.connectionProxyDictionary = [:] // direct connection (internal hostnames)
+        return URLSession(configuration: c)
+    }()
+
+    private static func getJSON(_ url: String, token: String) async -> (Int, [String: Any]?) {
+        guard let u = URL(string: url) else { return (-1, nil) }
+        var req = URLRequest(url: u)
+        req.httpMethod = "GET"
+        if !token.isEmpty { req.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
+        do {
+            let (data, resp) = try await session.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            return (code, (try? JSONSerialization.jsonObject(with: data)) as? [String: Any])
+        } catch {
+            return (-2, nil)
+        }
+    }
+
+    static func fetchAll(cfg: GatewayConfig) async -> Snapshot {
+        var s = Snapshot()
+        guard !cfg.baseURL.isEmpty else {
+            s.error = "No gateway URL configured.\nSet base_url in\n\(cfg.configPath)\nor VM2API_BASE_URL / ANTHROPIC_BASE_URL."
+            return s
+        }
+        guard !cfg.apiKey.isEmpty else {
+            s.error = "No API key configured.\nSet api_key in\n\(cfg.configPath)\nor VM2API_API_KEY / ANTHROPIC_AUTH_TOKEN."
+            return s
+        }
+
+        // 1. current account
+        let (code, usage) = await getJSON(cfg.baseURL + "/v1/usage?unit=percent_used", token: cfg.apiKey)
+        guard code == 200, let usage = usage else {
+            s.error = "/v1/usage failed (HTTP \(code)). Check the gateway URL / key."
+            return s
+        }
+        s.platform = asStr(usage["platform"]) ?? ""
+        s.source = asStr(usage["source"]) ?? ""
+        s.w5.parse(asDict(usage["five_hour"]))
+        s.w7.parse(asDict(usage["seven_day"]))
+        s.hasPanel = !cfg.panelToken.isEmpty
+
+        guard s.hasPanel else { s.ok = true; s.updatedAt = Date(); return s }
+
+        // 2. pool
+        let (_, vms) = await getJSON(cfg.baseURL + "/api/panel/vms", token: cfg.panelToken)
+        if let items = asArr(dig(vms, "data", "items")) {
+            for it in items {
+                guard let v = asDict(it) else { continue }
+                var a = PoolAccount()
+                a.id = asStr(v["id"]) ?? "-"
+                a.name = asStr(v["name"]) ?? "-"
+                a.u5 = Int((asNum(v["utilization_5h"]) ?? 0) * 100)
+                a.u7 = Int((asNum(v["utilization_7d"]) ?? 0) * 100)
+                a.status5 = asStr(v["status_5h"]) ?? "unknown"
+                a.status7 = asStr(v["status_7d"]) ?? "unknown"
+                a.r5Text = WindowInfo.resetText(asNum(v["reset_5h"]))
+                a.r7Text = WindowInfo.resetText(asNum(v["reset_7d"]))
+                a.est5 = est(v, "estimate_5h"); a.est7 = est(v, "estimate_7d")
+                s.pool.append(a)
+            }
+        }
+
+        // 3. billing
+        let (_, bill) = await getJSON(cfg.baseURL + "/api/panel/usage", token: cfg.panelToken)
+        if let b = dig(bill, "data", "billing") as? [String: Any] {
+            s.billing.source = asStr(b["source"]) ?? ""
+            s.billing.currency = asStr(b["currency"]) ?? "USD"
+            let today = asDict(b["today"]), w5 = asDict(b["window_5h"]), total = asDict(b["total"])
+            s.billing.today = usd(asNum(today?["total_cost"]))
+            s.billing.todayReq = intStr(asNum(today?["requests"]))
+            s.billing.w5 = usd(asNum(w5?["total_cost"]))
+            s.billing.w5Req = intStr(asNum(w5?["requests"]))
+            s.billing.total = usd(asNum(total?["total_cost"]))
+            s.billing.totalReq = intStr(asNum(total?["requests"]))
+            if let billingRoot = asDict(bill) {
+                s.billing.todaySince = asStr(billingRoot["today_start"]) ?? ""
+                s.billing.w5Since = asStr(billingRoot["window_5h_start"]) ?? ""
+            }
+        }
+
+        // 4. quality of service (last hour, same call as the console overview)
+        let df = ISO8601DateFormatter()
+        df.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let since = df.string(from: Date().addingTimeInterval(-3600))
+        let sinceEnc = since.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? since
+        let (_, stats) = await getJSON(cfg.baseURL + "/api/panel/request-logs/stats?bucket=hour&since=" + sinceEnc,
+                                       token: cfg.panelToken)
+        if let w = asDict(stats?["window"]) { s.qos = parseQoS(w) }
+
+        s.ok = true
+        s.updatedAt = Date()
+        return s
+    }
+
+    private static func est(_ v: [String: Any], _ key: String) -> String {
+        guard let e = asDict(v[key]),
+              let sp = asNum(e["spent_usd"]), let t = asNum(e["total_usd"]) else { return "" }
+        return String(format: "$%.2f/%.2f", sp, t)
+    }
+    private static func usd(_ n: Double?) -> String { n.map { String(format: "$%.2f", $0) } ?? "—" }
+    private static func intStr(_ n: Double?) -> String { n.map { String(Int($0)) } ?? "?" }
+    private static func ms(_ n: Double?) -> String {
+        guard let n = n else { return "—" }
+        return n >= 1000 ? String(format: "%.1fs", n / 1000) : String(format: "%.0fms", n)
+    }
+
+    private static func parseQoS(_ w: [String: Any]) -> QoSInfo {
+        var q = QoSInfo()
+        let ttft = asDict(w["ttft"]), dur = asDict(w["duration"])
+        q.samples = Int(asNum(ttft?["samples"]) ?? 0)
+        q.successPct = (asNum(w["sla"]) ?? 1) * 100
+        q.errorPct = (asNum(w["error_rate"]) ?? 0) * 100
+        q.c429 = Int(asNum(w["status_429"]) ?? 0)
+        q.c503 = Int(asNum(w["status_503"]) ?? 0)
+        q.c529 = Int(asNum(w["status_529"]) ?? 0)
+        q.ttft = "p50 \(ms(asNum(ttft?["p50_ms"]))) · p95 \(ms(asNum(ttft?["p95_ms"]))) · p99 \(ms(asNum(ttft?["p99_ms"]))) · avg \(ms(asNum(ttft?["avg_ms"])))"
+        q.duration = "p50 \(ms(asNum(dur?["p50_ms"]))) · p95 \(ms(asNum(dur?["p95_ms"]))) · avg \(ms(asNum(dur?["avg_ms"])))"
+        let qps = asDict(w["qps"]), tps = asDict(w["tps"])
+        q.qps = "cur \(String(format: "%.3f", asNum(qps?["current"]) ?? 0)) · peak \(String(format: "%.3f", asNum(qps?["peak"]) ?? 0))"
+        let tpsIn = asNum(w["input_tokens"]) ?? 0, tpsOut = asNum(w["output_tokens"]) ?? 0
+        _ = (tpsIn, tpsOut)
+        q.tps = "cur \(String(format: "%.1f", asNum(tps?["current"]) ?? 0)) · peak \(String(format: "%.1f", asNum(tps?["peak"]) ?? 0))"
+        if let c = asNum(w["cache_hit_rate"]) { q.cache = String(format: "%.1f%%", c * 100) }
+        if let st = asDict(w["sticky"]) {
+            let hits = Int(asNum(st["hits"]) ?? 0), sel = Int(asNum(st["selections"]) ?? 0)
+            q.sticky = "\(hits)/\(sel)" + (asNum(st["rate"]).map { String(format: " (%.0f%%)", $0 * 100) } ?? "")
+        }
+        for m in asArr(w["by_model"]) ?? [] {
+            guard let md = asDict(m) else { continue }
+            let name = asStr(md["model"]) ?? asStr(md["family"]) ?? asStr(md["name"]) ?? "-"
+            let req = intStr(asNum(md["requests"]))
+            let err = intStr(asNum(md["errors"]))
+            let mttft = asDict(md["ttft"])
+            let tt = ms(asNum(mttft?["avg_ms"]) ?? asNum(md["ttft_avg_ms"]))
+            let mdur = asDict(md["duration"])
+            let du = ms(asNum(mdur?["avg_ms"]) ?? asNum(md["duration_avg_ms"]))
+            q.models.append((name, req, err, tt, du))
+        }
+        return q
+    }
+}
+
+// MARK: - Severity colors
+
+enum Severity {
+    static func color(forPct pct: Int, status: String) -> NSColor {
+        if status == "blocked" || status == "throttled" { return .systemRed }
+        if pct >= 97 { return .systemRed }
+        if pct >= 90 { return .systemOrange }
+        if pct >= 70 { return .systemYellow }
+        return .systemGreen
+    }
+    static func tag(_ status: String) -> String {
+        switch status {
+        case "allowed", "active": return "OK"
+        case "allowed_warning": return "WARN"
+        case "blocked": return "BLOCKED"
+        case "throttled": return "THROTTLED"
+        default: return status.uppercased()
+        }
+    }
+    static func isWarn(_ status: String) -> Bool {
+        status == "allowed_warning" || status == "blocked" || status == "throttled"
+    }
+}
+
+// MARK: - State
+
+final class AppState: ObservableObject {
+    @Published var snap = Snapshot()
+    @Published var refreshing = false
+    var cfg = GatewayConfig.load()
+    private var timer: Timer?
+
+    func start() {
+        refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+    }
+
+    func refresh() {
+        guard !refreshing else { return }
+        refreshing = true
+        let cfg = self.cfg
+        Task {
+            let snap = await Fetcher.fetchAll(cfg: cfg)
+            await MainActor.run {
+                self.snap = snap
+                self.refreshing = false
+            }
+        }
+    }
+}
+
+// MARK: - Menu bar title
+
+enum BarTitle {
+    static func miniBar(_ pct: Int, cells: Int = 5) -> String {
+        let filled = max(0, min(cells, Int((Double(pct) * Double(cells) / 100.0).rounded())))
+        return String(repeating: "▮", count: filled) + String(repeating: "▯", count: cells - filled)
+    }
+
+    static func attributed(_ snap: Snapshot) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        let mono = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+        let labelFont = NSFont.systemFont(ofSize: 9, weight: .medium)
+        let baseColor = NSColor.labelColor
+
+        func add(_ s: String, _ f: NSFont, _ c: NSColor) {
+            out.append(NSAttributedString(string: s, attributes: [.font: f, .foregroundColor: c]))
+        }
+
+        guard snap.ok else {
+            add("Q ", mono, baseColor)
+            add(snap.error.isEmpty ? "…" : "⚠", mono, .systemRed)
+            return out
+        }
+        add("Q ", mono, baseColor)
+        for (label, w) in [("5h", snap.w5), ("7d", snap.w7)] {
+            let c = Severity.color(forPct: w.pct, status: w.status)
+            add(label + " ", labelFont, baseColor.withAlphaComponent(0.7))
+            add("\(w.pct) ", mono, c)
+            add(miniBar(w.pct) + "  ", mono, c)
+        }
+        if Severity.isWarn(snap.w5.status) || Severity.isWarn(snap.w7.status) {
+            add("⚠", mono, .systemOrange)
+        }
+        return out
+    }
+}
+
+// MARK: - Popover UI
+
+struct WindowRow: View {
+    let label: String
+    let w: WindowInfo
+    var est: String = ""
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 28, alignment: .leading)
+            ProgressView(value: Double(min(w.pct, 100)), total: 100)
+                .progressViewStyle(.linear)
+                .tint(Color(Severity.color(forPct: w.pct, status: w.status)))
+                .frame(width: 130)
+            Text("\(w.pct)%").font(.system(.callout, design: .monospaced).weight(.semibold))
+                .frame(width: 44, alignment: .trailing)
+            Text(Severity.tag(w.status))
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(Color(Severity.color(forPct: w.pct, status: w.status)))
+                .frame(width: 64, alignment: .leading)
+            VStack(alignment: .leading, spacing: 0) {
+                Text("resets " + w.resetsText).font(.caption2).foregroundStyle(.secondary)
+                if !est.isEmpty { Text("est " + est).font(.caption2).foregroundStyle(.secondary) }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 1)
+    }
+}
+
+struct SectionHeader: View {
+    let title: String
+    let subtitle: String
+    var body: some View {
+        HStack {
+            Text(title).font(.caption.weight(.bold)).foregroundStyle(.secondary)
+            Spacer()
+            Text(subtitle).font(.caption2).foregroundStyle(.tertiary)
+        }
+        .padding(.top, 8)
+    }
+}
+
+struct QoSRow: View {
+    let label: String, value: String
+    var body: some View {
+        HStack(alignment: .top) {
+            Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 108, alignment: .leading)
+            Text(value).font(.system(.caption, design: .monospaced))
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+struct PanelView: View {
+    @EnvironmentObject var state: AppState
+    private let fixed: CGFloat = 460
+
+    var body: some View {
+        let s = state.snap
+        ScrollView {
+            VStack(alignment: .leading, spacing: 4) {
+                // header
+                HStack {
+                    Text("vm2api quota").font(.headline)
+                    Text(state.cfg.baseURL.isEmpty ? "(not configured)" : state.cfg.baseURL)
+                        .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    if state.refreshing { ProgressView().controlSize(.small) }
+                    Button("Refresh") { state.refresh() }.controlSize(.small)
+                }
+                if !s.ok {
+                    Text(s.error).font(.callout).foregroundStyle(.red).padding(.top, 6)
+                    Text("config file: \(state.cfg.configPath)").font(.caption2).foregroundStyle(.secondary)
+                } else {
+                    // current account
+                    SectionHeader(title: "CURRENT ACCOUNT", subtitle: "platform \(s.platform) · source \(s.source)")
+                    WindowRow(label: "5h", w: s.w5)
+                    WindowRow(label: "7d", w: s.w7)
+
+                    // pool
+                    SectionHeader(title: "PER-ACCOUNT POOL",
+                                  subtitle: s.hasPanel ? "\(s.pool.count) account(s)" : "no panel credential")
+                    if s.hasPanel {
+                        ForEach(s.pool.indices, id: \.self) { i in
+                            let a = s.pool[i]
+                            VStack(alignment: .leading, spacing: 0) {
+                                Text("\(a.id) (\(a.name))").font(.caption.weight(.semibold)).padding(.top, 2)
+                                WindowRow(label: "5h", w: WindowInfo(pct: a.u5, status: a.status5, resetsAt: nil, resetsText: a.r5Text), est: a.est5)
+                                WindowRow(label: "7d", w: WindowInfo(pct: a.u7, status: a.status7, resetsAt: nil, resetsText: a.r7Text), est: a.est7)
+                            }
+                        }
+                        if s.pool.isEmpty { Text("no rows in /api/panel/vms").font(.caption2).foregroundStyle(.tertiary) }
+                    }
+
+                    // billing
+                    SectionHeader(title: "BILLING", subtitle: s.hasPanel ? "\(s.billing.source) (\(s.billing.currency))" : "no panel credential")
+                    if s.hasPanel {
+                        QoSRow(label: "today", value: "\(s.billing.today) · \(s.billing.todayReq) req · since \(s.billing.todaySince)")
+                        QoSRow(label: "5h window", value: "\(s.billing.w5) · \(s.billing.w5Req) req")
+                        QoSRow(label: "7d window", value: "\(s.billing.total) · \(s.billing.totalReq) req")
+                    }
+
+                    // quality of service
+                    SectionHeader(title: "QUALITY OF SERVICE", subtitle: s.hasPanel ? "last 1 hour · \(s.qos.samples) samples" : "no panel credential")
+                    if s.hasPanel {
+                        if s.qos.samples == 0 {
+                            Text("no samples in the last hour").font(.caption2).foregroundStyle(.tertiary)
+                        } else {
+                            QoSRow(label: "success rate", value: String(format: "%.1f%%", s.qos.successPct))
+                            QoSRow(label: "error rate", value: String(format: "%.1f%% · 429:%d 503:%d 529:%d", s.qos.errorPct, s.qos.c429, s.qos.c503, s.qos.c529))
+                            QoSRow(label: "first byte", value: s.qos.ttft)
+                            QoSRow(label: "duration", value: s.qos.duration)
+                            QoSRow(label: "qps", value: s.qos.qps)
+                            QoSRow(label: "tps", value: s.qos.tps)
+                            if !s.qos.cache.isEmpty { QoSRow(label: "cache hit", value: s.qos.cache) }
+                            if !s.qos.sticky.isEmpty { QoSRow(label: "sticky sessions", value: s.qos.sticky) }
+                            if !s.qos.models.isEmpty {
+                                VStack(spacing: 0) {
+                                    HStack {
+                                        Text("model").font(.caption2.weight(.bold)).foregroundStyle(.secondary).frame(width: 80, alignment: .leading)
+                                        Text("req").font(.caption2.weight(.bold)).foregroundStyle(.secondary).frame(width: 56, alignment: .trailing)
+                                        Text("err").font(.caption2.weight(.bold)).foregroundStyle(.secondary).frame(width: 40, alignment: .trailing)
+                                        Text("ttft").font(.caption2.weight(.bold)).foregroundStyle(.secondary).frame(width: 64, alignment: .trailing)
+                                        Text("dur").font(.caption2.weight(.bold)).foregroundStyle(.secondary).frame(width: 64, alignment: .trailing)
+                                        Spacer(minLength: 0)
+                                    }
+                                    ForEach(s.qos.models.indices, id: \.self) { i in
+                                        let m = s.qos.models[i]
+                                        HStack {
+                                            Text(m.name).font(.system(.caption2, design: .monospaced)).frame(width: 80, alignment: .leading)
+                                            Text(m.req).font(.system(.caption2, design: .monospaced)).frame(width: 56, alignment: .trailing)
+                                            Text(m.err).font(.system(.caption2, design: .monospaced)).frame(width: 40, alignment: .trailing)
+                                            Text(m.ttft).font(.system(.caption2, design: .monospaced)).frame(width: 64, alignment: .trailing)
+                                            Text(m.dur).font(.system(.caption2, design: .monospaced)).frame(width: 64, alignment: .trailing)
+                                            Spacer(minLength: 0)
+                                        }
+                                    }
+                                }.padding(.top, 2)
+                            }
+                        }
+                    }
+                }
+
+                // footer
+                HStack {
+                    Text("config: \(state.cfg.configPath)").font(.caption2).foregroundStyle(.tertiary)
+                    Spacer()
+                    Text("updated \(timeStr(s.updatedAt))").font(.caption2).foregroundStyle(.tertiary)
+                }.padding(.top, 10)
+            }
+            .padding(12)
+            .frame(minWidth: fixed + 60, alignment: .leading)
+        }
+        .frame(width: fixed + 60, height: 560)
+    }
+
+    private func timeStr(_ d: Date) -> String {
+        d == .distantPast ? "—" : {
+            let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f.string(from: d)
+        }()
+    }
+}
+
+// MARK: - App lifecycle
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let state = AppState()
+    private var statusItem: NSStatusItem!
+    private var popover: NSPopover!
+    private var monitor: Any?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.button?.action = #selector(toggle)
+        statusItem.button?.target = self
+        statusItem.button?.toolTip = "vm2api quota"
+
+        popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentViewController = NSHostingController(
+            rootView: PanelView().environmentObject(state))
+        popover.contentSize = NSSize(width: 520, height: 560)
+
+        monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            self?.popover.close()
+        }
+
+        state.$snap
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.renderTitle() }
+        renderTitle()
+        state.start()
+    }
+
+    private func renderTitle() {
+        statusItem.button?.attributedTitle = BarTitle.attributed(state.snap)
+        let s = state.snap
+        statusItem.button?.toolTip = s.ok
+            ? "vm2api quota — 5h \(s.w5.pct)% · 7d \(s.w7.pct)%"
+            : "vm2api quota — not configured / error"
+    }
+
+    @objc private func toggle() {
+        if popover.isShown {
+            popover.close()
+        } else {
+            popover.show(relativeTo: statusItem.button!.bounds, of: statusItem.button!, preferredEdge: .minY)
+            NSApp.activate(ignoringOtherApps: true)
+            state.refresh()
+        }
+    }
+}
+
+// main
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.run()
