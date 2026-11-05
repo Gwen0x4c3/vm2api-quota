@@ -5,7 +5,7 @@
     {
       "name": "vm2api-quota",
       "source": "./vm2api-quota",
-      "version": "0.4.1",
+      "version": "0.4.2",
       "description": "Type /quota to see 5h/7d usage quota, per-account pool quotas and billing from a vm2api gateway. Hook-intercepted, executed locally — zero LLM involvement, read-only GETs.",
       "displayName": "vm2api Quota",
       "category": "utilities"

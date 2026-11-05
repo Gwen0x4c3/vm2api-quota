@@ -145,7 +145,6 @@ struct QoSInfo {
 struct Snapshot {
     var ok = false
     var error = ""
-    var note = ""            // e.g. "window numbers from the pool (429)"
     var platform = "", source = ""
     var w5 = WindowInfo(), w7 = WindowInfo()
     var pool: [PoolAccount] = []
@@ -189,63 +188,77 @@ enum Fetcher {
             s.error = "No API key — open settings (⚙) and paste your key."
             return s
         }
-
-        // 1. current account
-        // When every pool account is rate-limited the gateway 429s /v1/usage
-        // itself; the panel endpoints still serve the real numbers, so fall
-        // back to them (first pool account) and note it.
-        let (code, usage) = await getJSON(cfg.baseURL + "/v1/usage?unit=percent_used", token: cfg.apiKey)
-        let usageOK = (code == 200)
-        if usageOK, let usage = usage {
-            s.platform = asStr(usage["platform"]) ?? ""
-            s.source = asStr(usage["source"]) ?? ""
-            s.w5.parse(asDict(usage["five_hour"]))
-            s.w7.parse(asDict(usage["seven_day"]))
-        } else if code == 429 {
-            s.note = "upstream rate-limited (429) — window numbers from the pool"
-            s.platform = "gateway"
-            s.source = "pool"
-        } else {
-            s.error = "/v1/usage failed (HTTP \(code)). Check the gateway URL / key."
-            return s
-        }
         s.hasPanel = !cfg.panelToken.isEmpty
 
-        guard s.hasPanel else {
-            if usageOK {
-                s.ok = true; s.updatedAt = Date()
-            } else {
-                s.error = "Quota exhausted — /v1/usage is rate-limited (429). Add a panel credential (the gateway master key) in settings ⚙ to keep showing pool-based numbers."
+        if s.hasPanel {
+            // PANEL-PRIMARY. /v1/usage is routed through the account pool like
+            // any inference call, so a fully rate-limited pool 429s it — hiding
+            // even the healthy 7d window. The panel endpoints read the
+            // gateway's local DB and always answer, so with a panel credential
+            // we never call /v1/usage.
+            let (_, vms) = await getJSON(cfg.baseURL + "/api/panel/vms", token: cfg.panelToken)
+            if let items = asArr(dig(vms, "data", "items")) {
+                for it in items {
+                    guard let v = asDict(it) else { continue }
+                    var a = PoolAccount()
+                    a.id = asStr(v["id"]) ?? "-"
+                    a.name = asStr(v["name"]) ?? "-"
+                    a.u5 = Int((asNum(v["utilization_5h"]) ?? 0) * 100)
+                    a.u7 = Int((asNum(v["utilization_7d"]) ?? 0) * 100)
+                    a.status5 = asStr(v["status_5h"]) ?? "unknown"
+                    a.status7 = asStr(v["status_7d"]) ?? "unknown"
+                    a.r5 = asNum(v["reset_5h"])
+                    a.r7 = asNum(v["reset_7d"])
+                    a.est5 = est(v, "estimate_5h"); a.est7 = est(v, "estimate_7d")
+                    s.pool.append(a)
+                }
             }
+            guard let c = chooseCurrent(s.pool) else {
+                s.error = "Panel credential is set but /api/panel/vms returned no accounts."
+                return s
+            }
+            s.w5.pct = c.u5; s.w5.status = c.status5; s.w5.resetsAt = c.r5
+            s.w5.resetsText = WindowInfo.resetText(c.r5)
+            s.w7.pct = c.u7; s.w7.status = c.status7; s.w7.resetsAt = c.r7
+            s.w7.resetsText = WindowInfo.resetText(c.r7)
+            s.platform = "gateway"; s.source = "pool"
+
+            await fetchBillingAndQoS(cfg: cfg, into: &s)
+            s.ok = true
+            s.updatedAt = Date()
             return s
         }
 
-        // 2. pool
-        let (_, vms) = await getJSON(cfg.baseURL + "/api/panel/vms", token: cfg.panelToken)
-        if let items = asArr(dig(vms, "data", "items")) {
-            for it in items {
-                guard let v = asDict(it) else { continue }
-                var a = PoolAccount()
-                a.id = asStr(v["id"]) ?? "-"
-                a.name = asStr(v["name"]) ?? "-"
-                a.u5 = Int((asNum(v["utilization_5h"]) ?? 0) * 100)
-                a.u7 = Int((asNum(v["utilization_7d"]) ?? 0) * 100)
-                a.status5 = asStr(v["status_5h"]) ?? "unknown"
-                a.status7 = asStr(v["status_7d"]) ?? "unknown"
-                a.r5 = asNum(v["reset_5h"])
-                a.r7 = asNum(v["reset_7d"])
-                a.est5 = est(v, "estimate_5h"); a.est7 = est(v, "estimate_7d")
-                s.pool.append(a)
-            }
+        // No panel credential: /v1/usage is the only source (needs just an
+        // sk-vm key). It 429s when the pool is drained — surface that clearly.
+        let (code, usage) = await getJSON(cfg.baseURL + "/v1/usage?unit=percent_used", token: cfg.apiKey)
+        guard code == 200, let usage = usage else {
+            s.error = code == 429
+                ? "Quota exhausted — /v1/usage is rate-limited (429). Add a panel credential (the gateway master key) in settings ⚙ for always-available pool numbers."
+                : "/v1/usage failed (HTTP \(code)). Check the gateway URL / key."
+            return s
         }
-        if !usageOK, let f = s.pool.first {
-            s.w5.pct = f.u5; s.w5.status = f.status5; s.w5.resetsAt = f.r5
-            s.w5.resetsText = WindowInfo.resetText(f.r5)
-            s.w7.pct = f.u7; s.w7.status = f.status7; s.w7.resetsAt = f.r7
-            s.w7.resetsText = WindowInfo.resetText(f.r7)
-        }
+        s.platform = asStr(usage["platform"]) ?? ""
+        s.source = asStr(usage["source"]) ?? ""
+        s.w5.parse(asDict(usage["five_hour"]))
+        s.w7.parse(asDict(usage["seven_day"]))
+        s.ok = true
+        s.updatedAt = Date()
+        return s
+    }
 
-        // 3. billing
+    /// The account the scheduler would hand the next request to: the
+    /// least-5h-utilized schedulable account, or — when every account is
+    /// rate-limited — the one whose 5h window resets soonest.
+    static func chooseCurrent(_ pool: [PoolAccount]) -> PoolAccount? {
+        guard !pool.isEmpty else { return nil }
+        if let m = pool.filter({ !Severity.isBlocked($0.status5) }).min(by: { $0.u5 < $1.u5 }) {
+            return m
+        }
+        return pool.min(by: { ($0.r5 ?? .infinity) < ($1.r5 ?? .infinity) })
+    }
+
+    private static func fetchBillingAndQoS(cfg: GatewayConfig, into s: inout Snapshot) async {
         let (_, bill) = await getJSON(cfg.baseURL + "/api/panel/usage", token: cfg.panelToken)
         if let b = dig(bill, "data", "billing") as? [String: Any] {
             s.billing.source = asStr(b["source"]) ?? ""
@@ -262,7 +275,6 @@ enum Fetcher {
             }
         }
 
-        // 4. quality of service (last hour, same call as the console overview)
         let df = ISO8601DateFormatter()
         df.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let since = df.string(from: Date().addingTimeInterval(-3600))
@@ -270,10 +282,6 @@ enum Fetcher {
         let (_, stats) = await getJSON(cfg.baseURL + "/api/panel/request-logs/stats?bucket=hour&since=" + sinceEnc,
                                        token: cfg.panelToken)
         if let w = asDict(stats?["window"]) { s.qos = parseQoS(w) }
-
-        s.ok = true
-        s.updatedAt = Date()
-        return s
     }
 
     private static func est(_ v: [String: Any], _ key: String) -> String {
@@ -642,11 +650,6 @@ struct PanelView: View {
                       status: s.w7.status,
                       resetText: WindowInfo.resetShort(s.w7.resetsAt),
                       est: single?.est7 ?? "")
-            if !s.note.isEmpty {
-                Text(s.note)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.orange)
-            }
             if !s.hasPanel {
                 Text("pool · billing · QoS need a panel credential — add one in settings ⚙")
                     .font(.system(size: 10))
