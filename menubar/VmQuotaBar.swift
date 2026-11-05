@@ -50,6 +50,7 @@ struct GatewayConfig {
     var apiKey: String
     var panelToken: String
     var show7d: Bool
+    var notifyRefresh: Bool
     var configPath: String
 
     static var path: String { NSHomeDirectory() + "/.config/vm2api-quota/menubar.json" }
@@ -65,17 +66,19 @@ struct GatewayConfig {
                              apiKey: asStr(cfg["api_key"]) ?? "",
                              panelToken: asStr(cfg["panel_token"]) ?? "",
                              show7d: cfg["show_7d"] as? Bool ?? true,
+                             notifyRefresh: cfg["notify_refresh"] as? Bool ?? true,
                              configPath: path)
     }
 
-    static func save(baseURL: String, apiKey: String, panelToken: String, show7d: Bool) -> Bool {
+    static func save(baseURL: String, apiKey: String, panelToken: String, show7d: Bool, notifyRefresh: Bool) -> Bool {
         let trimmed = { (s: String) in s.trimmingCharacters(in: .whitespacesAndNewlines) }
         var base = trimmed(baseURL)
         while base.hasSuffix("/") { base = String(base.dropLast()) }
         let obj: [String: Any] = ["base_url": base,
                                   "api_key": trimmed(apiKey),
                                   "panel_token": trimmed(panelToken),
-                                  "show_7d": show7d]
+                                  "show_7d": show7d,
+                                  "notify_refresh": notifyRefresh]
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) else { return false }
         let dir = (path as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
@@ -364,6 +367,7 @@ final class AppState: ObservableObject {
     @Published var refreshing = false
     var cfg = GatewayConfig.load()
     private var timer: Timer?
+    private var lastPool: [String: PoolAccount] = [:]  // id -> previous windows, for roll detection
 
     func start() {
         refresh()
@@ -373,8 +377,8 @@ final class AppState: ObservableObject {
     }
 
     /// Save the settings form, reload config, and refresh immediately.
-    func saveConfig(baseURL: String, apiKey: String, panelToken: String, show7d: Bool) -> Bool {
-        guard GatewayConfig.save(baseURL: baseURL, apiKey: apiKey, panelToken: panelToken, show7d: show7d) else { return false }
+    func saveConfig(baseURL: String, apiKey: String, panelToken: String, show7d: Bool, notifyRefresh: Bool) -> Bool {
+        guard GatewayConfig.save(baseURL: baseURL, apiKey: apiKey, panelToken: panelToken, show7d: show7d, notifyRefresh: notifyRefresh) else { return false }
         cfg = GatewayConfig.load()
         refresh()
         return true
@@ -389,8 +393,60 @@ final class AppState: ObservableObject {
             await MainActor.run {
                 self.snap = snap
                 self.refreshing = false
+                if snap.ok { self.detectWindowRolls(snap) }
             }
         }
+    }
+
+    // MARK: window-refresh notifications
+
+    /// A window "rolled" when its reset epoch moved to a LATER value (the old
+    /// window passed and a fresh one started). Only notify for windows that
+    /// were meaningfully used before the roll, to avoid noise.
+    private func detectWindowRolls(_ snap: Snapshot) {
+        if ProcessInfo.processInfo.environment["VMQUOTA_DEBUG_NOTIFY"] == "1", lastPool.isEmpty {
+            notify("test: notification channel is working (5h window roll alerts will look like this)")
+        }
+        var messages: [String] = []
+        for a in windowsToWatch(snap) {
+            defer { lastPool[a.id] = a }
+            guard let old = lastPool[a.id] else { continue }
+            if let or5 = old.r5, let nr5 = a.r5, nr5 > or5,
+               old.u5 >= 50 || Severity.isWarn(old.status5) {
+                messages.append("\(a.id) (\(a.name)): 5h window refreshed — now \(a.u5)% used")
+            }
+            if let or7 = old.r7, let nr7 = a.r7, nr7 > or7, old.u7 >= 50 {
+                messages.append("\(a.id) (\(a.name)): 7d window refreshed — now \(a.u7)% used")
+            }
+        }
+        guard !messages.isEmpty else { return }
+        if cfg.notifyRefresh {
+            for m in messages { notify(m) }
+        }
+    }
+
+    /// Per-account windows when panel data exists; otherwise the single
+    /// current-account window pair (from /v1/usage).
+    private func windowsToWatch(_ snap: Snapshot) -> [PoolAccount] {
+        if !snap.pool.isEmpty { return snap.pool }
+        var cur = PoolAccount()
+        cur.id = "current"; cur.name = "current"
+        cur.u5 = snap.w5.pct; cur.u7 = snap.w7.pct
+        cur.status5 = snap.w5.status; cur.status7 = snap.w7.status
+        cur.r5 = snap.w5.resetsAt; cur.r7 = snap.w7.resetsAt
+        return [cur]
+    }
+
+    /// macOS notification + sound via osascript (works for both the bare
+    /// binary and the .app bundle, no extra permission plumbing).
+    private func notify(_ message: String) {
+        let esc = message.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e",
+                       "display notification \"\(esc)\" with title \"vm2api quota\" sound name \"Glass\""]
+        try? p.run()
     }
 }
 
@@ -490,6 +546,7 @@ struct SettingsForm: View {
     @State private var key = ""
     @State private var panel = ""
     @State private var show7d = true
+    @State private var notifyRefresh = true
     @State private var saved = false
     @State private var failed = false
 
@@ -508,9 +565,11 @@ struct SettingsForm: View {
                 .font(.system(.callout, design: .monospaced))
             Toggle("Show 7d in the menu bar", isOn: $show7d)
                 .font(.system(size: 11))
+            Toggle("Notify when a quota window refreshes", isOn: $notifyRefresh)
+                .font(.system(size: 11))
             HStack {
                 Button("Save & Refresh") {
-                    if state.saveConfig(baseURL: base, apiKey: key, panelToken: panel, show7d: show7d) {
+                    if state.saveConfig(baseURL: base, apiKey: key, panelToken: panel, show7d: show7d, notifyRefresh: notifyRefresh) {
                         saved = true; failed = false
                     } else {
                         failed = true; saved = false
@@ -529,6 +588,7 @@ struct SettingsForm: View {
             key = state.cfg.apiKey
             panel = state.cfg.panelToken
             show7d = state.cfg.show7d
+            notifyRefresh = state.cfg.notifyRefresh
         }
     }
 }
