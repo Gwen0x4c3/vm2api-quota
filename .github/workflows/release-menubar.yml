@@ -1,0 +1,40 @@
+name: release-menubar
+
+# Build the VmQuotaBar.app universal zip and attach it to a GitHub Release.
+# Trigger: push a version tag (git tag v0.4.5 && git push --tags), or run
+# manually from the Actions tab (uses the version in plugin.json).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build universal .app zip
+        run: menubar/build.sh --app --universal --zip
+
+      - name: Create release and upload the zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="v$(jq -r .version vm2api-quota/.zcode-plugin/plugin.json)"
+            TARGET="--target $GITHUB_SHA"
+          else
+            TAG="$GITHUB_REF_NAME"
+            TARGET=""
+          fi
+          echo "releasing $TAG"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" menubar/bin/VmQuotaBar-*.zip --clobber
+          else
+            # shellcheck disable=SC2086
+            gh release create "$TAG" $TARGET --generate-notes \
+              --title "VmQuotaBar $TAG" menubar/bin/VmQuotaBar-*.zip
+          fi

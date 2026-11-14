@@ -70,6 +70,8 @@ cd menubar
 open bin/VmQuotaBar.app       #   and launch it (login item: add in System Settings)
 ```
 
+**No build needed?** Grab the ready-made universal `.app` from [Releases](https://github.com/Gwen0x4c3/vm2api-quota/releases) — unzip, right-click → Open the first time (unsigned), then configure via ⚙. Releases are built automatically by CI on every `v*` tag.
+
 Requires Xcode Command Line Tools (`xcode-select --install`).
 
 ## Manage
