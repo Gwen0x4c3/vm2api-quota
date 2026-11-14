@@ -422,10 +422,10 @@ final class AppState: ObservableObject {
             guard let old = lastPool[a.id] else { continue }
             if let or5 = old.r5, let nr5 = a.r5, nr5 > or5,
                old.u5 >= 50 || Severity.isWarn(old.status5) {
-                messages.append("\(a.id) (\(a.name)): 5h window refreshed — now \(a.u5)% used")
+                messages.append("\(a.id) (\(a.name)): 5h window refreshed — now \(a.u5)% used, 7d at \(a.u7)%")
             }
             if let or7 = old.r7, let nr7 = a.r7, nr7 > or7, old.u7 >= 50 {
-                messages.append("\(a.id) (\(a.name)): 7d window refreshed — now \(a.u7)% used")
+                messages.append("\(a.id) (\(a.name)): 7d window refreshed — now \(a.u7)% used, 5h at \(a.u5)%")
             }
         }
         guard !messages.isEmpty else { return }
@@ -915,6 +915,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+
+        // A menu-bar-only app has no main menu by default, and Cmd+C/V/X/A key
+        // equivalents are delivered THROUGH the Edit menu — without it, paste
+        // into the settings fields does nothing. Install a minimal Edit menu.
+        let editMenu = NSMenu()
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let editMenuItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+        editMenuItem.submenu = editMenu
+        let mainMenu = NSMenu(title: "Main")
+        mainMenu.addItem(editMenuItem)
+        NSApp.mainMenu = mainMenu
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.action = #selector(toggle)
