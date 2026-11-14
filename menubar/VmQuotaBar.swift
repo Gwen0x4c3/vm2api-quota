@@ -51,6 +51,7 @@ struct GatewayConfig {
     var panelToken: String
     var show7d: Bool
     var notifyRefresh: Bool
+    var feishuWebhook: String
     var configPath: String
 
     static var path: String { NSHomeDirectory() + "/.config/vm2api-quota/menubar.json" }
@@ -67,10 +68,12 @@ struct GatewayConfig {
                              panelToken: asStr(cfg["panel_token"]) ?? "",
                              show7d: cfg["show_7d"] as? Bool ?? true,
                              notifyRefresh: cfg["notify_refresh"] as? Bool ?? true,
+                             feishuWebhook: asStr(cfg["feishu_webhook"]) ?? "",
                              configPath: path)
     }
 
-    static func save(baseURL: String, apiKey: String, panelToken: String, show7d: Bool, notifyRefresh: Bool) -> Bool {
+    static func save(baseURL: String, apiKey: String, panelToken: String, show7d: Bool,
+                     notifyRefresh: Bool, feishuWebhook: String) -> Bool {
         let trimmed = { (s: String) in s.trimmingCharacters(in: .whitespacesAndNewlines) }
         var base = trimmed(baseURL)
         while base.hasSuffix("/") { base = String(base.dropLast()) }
@@ -78,7 +81,8 @@ struct GatewayConfig {
                                   "api_key": trimmed(apiKey),
                                   "panel_token": trimmed(panelToken),
                                   "show_7d": show7d,
-                                  "notify_refresh": notifyRefresh]
+                                  "notify_refresh": notifyRefresh,
+                                  "feishu_webhook": trimmed(feishuWebhook)]
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) else { return false }
         let dir = (path as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
@@ -377,8 +381,10 @@ final class AppState: ObservableObject {
     }
 
     /// Save the settings form, reload config, and refresh immediately.
-    func saveConfig(baseURL: String, apiKey: String, panelToken: String, show7d: Bool, notifyRefresh: Bool) -> Bool {
-        guard GatewayConfig.save(baseURL: baseURL, apiKey: apiKey, panelToken: panelToken, show7d: show7d, notifyRefresh: notifyRefresh) else { return false }
+    func saveConfig(baseURL: String, apiKey: String, panelToken: String, show7d: Bool,
+                    notifyRefresh: Bool, feishuWebhook: String) -> Bool {
+        guard GatewayConfig.save(baseURL: baseURL, apiKey: apiKey, panelToken: panelToken, show7d: show7d,
+                                 notifyRefresh: notifyRefresh, feishuWebhook: feishuWebhook) else { return false }
         cfg = GatewayConfig.load()
         refresh()
         return true
@@ -406,6 +412,9 @@ final class AppState: ObservableObject {
     private func detectWindowRolls(_ snap: Snapshot) {
         if ProcessInfo.processInfo.environment["VMQUOTA_DEBUG_NOTIFY"] == "1", lastPool.isEmpty {
             notify("test: notification channel is working (5h window roll alerts will look like this)")
+            if !cfg.feishuWebhook.isEmpty {
+                sendFeishu("vm2api quota — test message (window-roll alerts will look like this)")
+            }
         }
         var messages: [String] = []
         for a in windowsToWatch(snap) {
@@ -422,6 +431,9 @@ final class AppState: ObservableObject {
         guard !messages.isEmpty else { return }
         if cfg.notifyRefresh {
             for m in messages { notify(m) }
+            if !cfg.feishuWebhook.isEmpty {
+                sendFeishu("vm2api quota\n" + messages.joined(separator: "\n"))
+            }
         }
     }
 
@@ -447,6 +459,27 @@ final class AppState: ObservableObject {
         p.arguments = ["-e",
                        "display notification \"\(esc)\" with title \"vm2api quota\" sound name \"Glass\""]
         try? p.run()
+    }
+
+    /// Feishu (Lark) custom-bot webhook: POST a text message so alerts reach
+    /// you when away from the Mac. Enabled simply by configuring the URL.
+    private func sendFeishu(_ text: String) {
+        guard let u = URL(string: cfg.feishuWebhook) else { return }
+        var req = URLRequest(url: u)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 15
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "msg_type": "text",
+            "content": ["text": text],
+        ])
+        URLSession.shared.dataTask(with: req) { _, resp, err in
+            if let err = err {
+                fputs("[VmQuotaBar] feishu send failed: \(err.localizedDescription)\n", stderr)
+            } else if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                fputs("[VmQuotaBar] feishu webhook returned HTTP \(http.statusCode)\n", stderr)
+            }
+        }.resume()
     }
 }
 
@@ -547,6 +580,7 @@ struct SettingsForm: View {
     @State private var panel = ""
     @State private var show7d = true
     @State private var notifyRefresh = true
+    @State private var feishu = ""
     @State private var saved = false
     @State private var failed = false
 
@@ -563,13 +597,17 @@ struct SettingsForm: View {
             SecureField("Panel token (optional — a master key already covers it)", text: $panel)
                 .textFieldStyle(.roundedBorder)
                 .font(.system(.callout, design: .monospaced))
+            SecureField("Feishu bot webhook URL (optional — alerts when away)", text: $feishu)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.callout, design: .monospaced))
             Toggle("Show 7d in the menu bar", isOn: $show7d)
                 .font(.system(size: 11))
             Toggle("Notify when a quota window refreshes", isOn: $notifyRefresh)
                 .font(.system(size: 11))
             HStack {
                 Button("Save & Refresh") {
-                    if state.saveConfig(baseURL: base, apiKey: key, panelToken: panel, show7d: show7d, notifyRefresh: notifyRefresh) {
+                    if state.saveConfig(baseURL: base, apiKey: key, panelToken: panel, show7d: show7d,
+                                        notifyRefresh: notifyRefresh, feishuWebhook: feishu) {
                         saved = true; failed = false
                     } else {
                         failed = true; saved = false
@@ -589,6 +627,7 @@ struct SettingsForm: View {
             panel = state.cfg.panelToken
             show7d = state.cfg.show7d
             notifyRefresh = state.cfg.notifyRefresh
+            feishu = state.cfg.feishuWebhook
         }
     }
 }
